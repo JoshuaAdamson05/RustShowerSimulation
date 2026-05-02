@@ -4,6 +4,7 @@ use rand::{random, random_range};
 fn main() {
     const NUM_PARTICLES: usize = 100;
     const NUM_STEPS: usize = 400_000;
+    const NUM_RUNS: usize = 5;
     const NUM_OF_THREADS: usize = 5;
     let mut ps = ParticleSystem::new();
 
@@ -17,8 +18,8 @@ fn main() {
     let ps_sequential = ps.clone();
     let ps_threaded = ps.clone();
 
-    run_sequential_simulation(ps_sequential, NUM_STEPS);
-    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_OF_THREADS);
+    run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS);
+    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_OF_THREADS, NUM_RUNS);
 }
 
 pub fn update_particle_chunk(particles : &mut [Particle])
@@ -29,32 +30,45 @@ pub fn update_particle_chunk(particles : &mut [Particle])
     }
 }
 
-fn run_threaded_simulation(mut ps: ParticleSystem, steps: usize, num_threads: usize)
+fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize)
 {
-    let chunk_size: usize = ps.particles.len() / num_threads;   
-    let mut pool = scoped_threadpool::Pool::new(num_threads as u32);
+    let mut total = 0.0;
+    for _ in 0..runs {
+        let mut ps_clone = ps.clone();
+        let chunk_size: usize = ps_clone.particles.len() / num_threads;   
+        let mut pool = scoped_threadpool::Pool::new(num_threads as u32);
 
-    let start = Instant::now();
-    pool.scoped(|scope| {
-        for slice in ps.particles.chunks_mut(chunk_size) 
-        {
-            scope.execute(move || {
-                for _ in 0..steps{
-                    update_particle_chunk(slice);
-                }
-            });
-        }
-    });
-    let duration = start.elapsed();
-    println!("Threaded time taken: {:?}", duration);
+        let start = Instant::now();
+        pool.scoped(|scope| {
+            for slice in ps_clone.particles.chunks_mut(chunk_size) 
+            {
+                scope.execute(move || {
+                    for _ in 0..steps{
+                        update_particle_chunk(slice);
+                    }
+                });
+            }
+        });
+        let duration = start.elapsed();
+        total += duration.as_secs_f64();
+    }
+    println!("Threaded avg time: {:.6} s", total / runs as f64);
 }
 
-fn run_sequential_simulation(mut ps: ParticleSystem, steps: usize)
+fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize)
 {
-    let start = Instant::now();
-    ps.simulate_particle_movement(steps);
-    let duration = start.elapsed();
-    println!("Sequential time taken: {:?}", duration);
+    let mut total = 0.0;
+
+    for _ in 0..runs {
+        let mut ps_clone = ps.clone();
+
+        let start = Instant::now();
+        ps_clone.simulate_particle_movement(steps);
+        let duration = start.elapsed();
+        total += duration.as_secs_f64();
+    }
+    
+    println!("Sequential avg time: {:.6} s", total / runs as f64);
 }
 
 #[derive(Debug, Copy, Clone)]
