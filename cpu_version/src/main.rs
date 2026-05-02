@@ -5,7 +5,7 @@ fn main() {
     const NUM_PARTICLES: usize = 100;
     const NUM_STEPS: usize = 400_000;
     const NUM_RUNS: usize = 5;
-    const NUM_OF_THREADS: usize = 5;
+    const PHYSICS_THREADS: usize = 2;
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
     let mut ps = ParticleSystem::new();
@@ -23,7 +23,7 @@ fn main() {
     let ps_threaded = ps.clone();
 
     run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY);
-    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_OF_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY);
+    run_threaded_simulation(ps_threaded, NUM_STEPS, PHYSICS_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY);
 }
 
 pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, gravity : f32)
@@ -114,12 +114,6 @@ impl Particle
             self.vx = -self.vx;
         }
 
-        if self.y <= 0.0{
-            self.y = 0.0;
-            self.vy = 0.0;
-            self.vx *= 0.95;
-        }
-
         self.x = self.x.clamp(0.0, 10.0);
         self.y = self.y.clamp(0.0, 10.0);
     }
@@ -127,27 +121,52 @@ impl Particle
 
 #[derive(Clone)]
 pub struct ParticleSystem {
-    particles: Vec<Particle>
+    particles: Vec<Particle>,
+    floor_hits: usize
 }
 
 impl ParticleSystem {
     pub fn new() -> ParticleSystem {
         ParticleSystem {
-            particles: Vec::new()
+            particles: Vec::new(),
+            floor_hits: 0
         }
     }
 
-    pub fn move_particles(&mut self, delta_time : f32, gravity : f32)
+    pub fn update_physics(&mut self, delta_time : f32, gravity : f32)
     {
         for particle in &mut self.particles{
             particle.update_position(delta_time, gravity);
+
+            if particle.y <= 0.0 {
+                self.floor_hits += 1;
+                Self::respawn_particle(particle);
+            }
         }
+    }
+
+    pub fn resolve_collisions(&mut self) {
+        // TODO: collision detection + merging
+    }
+
+    pub fn update_temperature(&mut self) {
+        // TODO: cooling formula
     }
 
     pub fn simulate_particle_movement(&mut self, steps: usize, delta_time : f32, gravity : f32)
     {
         for _ in 0..steps{
-            self.move_particles(delta_time, gravity);
+            self.update_physics(delta_time, gravity);
+
         }
+    }
+
+    pub fn respawn_particle(p: &mut Particle)
+    {
+        p.x = random_range(0.45..=0.55);
+        p.y = 2.0;
+
+        p.vx = random_range(-2.0..=2.0);
+        p.vy = random_range(-5.0..=-1.0);
     }
  }
