@@ -1,36 +1,40 @@
 use std::{time::Instant};
-use rand::{random, random_range};
+use rand::{random_range};
 
 fn main() {
     const NUM_PARTICLES: usize = 100;
     const NUM_STEPS: usize = 400_000;
     const NUM_RUNS: usize = 5;
     const NUM_OF_THREADS: usize = 5;
+    const GRAVITY: f32 = -9.81;
+    const DELTA_TIME: f32 = 1.0 / 60.0;
     let mut ps = ParticleSystem::new();
 
     for _ in 0..NUM_PARTICLES{
         let x: f32 = random_range(0.0..=10.0);
         let y: f32 = random_range(0.0..=10.0);
-        let p = Particle::new(x, y);
+        let vx: f32 = random_range(-2.0..=2.0);
+        let vy: f32 = random_range(-2.0..=2.0);
+        let p = Particle::new(x, y, vx, vy);
         ps.particles.push(p);
     }
 
     let ps_sequential = ps.clone();
     let ps_threaded = ps.clone();
 
-    run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS);
-    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_OF_THREADS, NUM_RUNS);
+    run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY);
+    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_OF_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY);
 }
 
-pub fn update_particle_chunk(particles : &mut [Particle])
+pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, gravity : f32)
 {
     for particle in particles
     {
-        particle.move_random_distance();
+        particle.update_position(delta_time, gravity);
     }
 }
 
-fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize)
+fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize, delta_time : f32, gravity : f32)
 {
     let mut total = 0.0;
     for _ in 0..runs {
@@ -44,7 +48,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             {
                 scope.execute(move || {
                     for _ in 0..steps{
-                        update_particle_chunk(slice);
+                        update_particle_chunk(slice, delta_time, gravity);
                     }
                 });
             }
@@ -55,7 +59,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
     println!("Threaded avg time: {:.6} s", total / runs as f64);
 }
 
-fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize)
+fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delta_time : f32, gravity : f32)
 {
     let mut total = 0.0;
 
@@ -63,7 +67,7 @@ fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize)
         let mut ps_clone = ps.clone();
 
         let start = Instant::now();
-        ps_clone.simulate_particle_movement(steps);
+        ps_clone.simulate_particle_movement(steps, delta_time, gravity);
         let duration = start.elapsed();
         total += duration.as_secs_f64();
     }
@@ -74,24 +78,47 @@ fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize)
 #[derive(Debug, Copy, Clone)]
 pub struct Particle {
     x: f32,
-    y: f32
+    y: f32,
+    vx: f32,
+    vy: f32
 }
 
 impl Particle
 {
-    pub fn new(x_variable: f32, y_variable: f32) -> Particle{
+    pub fn new(x_variable: f32, y_variable: f32, vx_variable: f32, vy_variable: f32) -> Particle{
         Particle{
             x: x_variable,
-            y: y_variable
+            y: y_variable,
+            vx: vx_variable,
+            vy: vy_variable
         }
     }
 
-    pub fn move_random_distance(&mut self)
+    pub fn update_position(&mut self, delta_time: f32, gravity: f32)
     {
-        let x = random::<f32>();
-        let y = random::<f32>();
-        self.x += x;
-        self.y +=y;
+        if self.y > 0.0 {
+            self.vy += gravity * delta_time;
+        }
+
+        self.x += self.vx * delta_time;
+
+        self.y += self.vy * delta_time;
+
+        if self.x <= 0.0 {
+            self.x = 0.0;
+            self.vx = -self.vx;
+        }
+
+        if self.x >= 10.0 {
+            self.x = 10.0;
+            self.vx = -self.vx;
+        }
+
+        if self.y <= 0.0{
+            self.y = 0.0;
+            self.vy = 0.0;
+            self.vx *= 0.95;
+        }
 
         self.x = self.x.clamp(0.0, 10.0);
         self.y = self.y.clamp(0.0, 10.0);
@@ -110,17 +137,17 @@ impl ParticleSystem {
         }
     }
 
-    pub fn move_particles(&mut self)
+    pub fn move_particles(&mut self, delta_time : f32, gravity : f32)
     {
         for particle in &mut self.particles{
-            particle.move_random_distance();
+            particle.update_position(delta_time, gravity);
         }
     }
 
-    pub fn simulate_particle_movement(&mut self, steps: usize)
+    pub fn simulate_particle_movement(&mut self, steps: usize, delta_time : f32, gravity : f32)
     {
         for _ in 0..steps{
-            self.move_particles();
+            self.move_particles(delta_time, gravity);
         }
     }
  }
