@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use rand::{random_range};
 
 fn main() {
-    const DEBUG_LOGGING: bool = true;
-    const NUM_PARTICLES: usize = 1_000;
-    const NUM_STEPS: usize = 400_000;
+    const DEBUG_LOGGING: bool = false;
+    const NUM_PARTICLES: usize = 10_000;
+    const NUM_STEPS: usize = 10_000;
     const NUM_RUNS: usize = 5;
     const PHYSICS_THREADS: usize = 2;
     const GRAVITY: f32 = -9.81;
@@ -138,6 +138,8 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             ps_clone.stats.collision_count += merges;
             ps_clone.stats.merge_count += merges;
 
+            ps_clone.resolve_collisions(collision_radius);
+
             ps_clone.update_temperature();
 
             if debug_logging && step % 20_000 == 0 {
@@ -225,12 +227,6 @@ pub struct SimulationStats {
     merge_count: usize
 }
 
-#[derive(Clone, Copy)]
-pub struct CollisionPair {
-    a: usize, 
-    b: usize
-}
-
 #[derive(Clone)]
 pub struct ParticleSystem {
     particles: Vec<Particle>,
@@ -300,33 +296,6 @@ impl ParticleSystem {
 
             new_particles.push(current);
         }
-        self.particles = new_particles;
-    }
-
-    pub fn resolve_collisions_pairs(&mut self, pairs: Vec<CollisionPair>) {
-        let mut merged = vec![false; self.particles.len()];
-        let mut new_particles: Vec<Particle> = Vec::new();
-
-        for i in 0..self.particles.len() {
-            if merged[i] {
-                continue;
-            }
-
-            let mut current = self.particles[i];
-
-            for pair in &pairs {
-                if pair.a == i && !merged[pair.b] {
-                    current = Self::merge(&current, &self.particles[pair.b]);
-                    merged[pair.b] = true;
-
-                    self.stats.collision_count += 1;
-                    self.stats.merge_count += 1;
-                }
-            }
-
-            new_particles.push(current);
-        }
-
         self.particles = new_particles;
     }
 
