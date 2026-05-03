@@ -11,6 +11,7 @@ fn main() {
     const PHYSICS_THREADS: usize = 2;
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
+    const COLLISION_RADIUS: f32 = 0.01;
     let mut ps = ParticleSystem::new();
 
     for _ in 0..NUM_PARTICLES{
@@ -25,8 +26,8 @@ fn main() {
     let ps_sequential = ps.clone();
     let ps_threaded = ps.clone();
 
-    run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY, DEBUG_LOGGING);
-    run_threaded_simulation(ps_threaded, NUM_STEPS, PHYSICS_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, DEBUG_LOGGING);
+    run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, DEBUG_LOGGING);
+    run_threaded_simulation(ps_threaded, NUM_STEPS, PHYSICS_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, DEBUG_LOGGING);
 }
 
 pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, gravity : f32) -> usize {
@@ -43,20 +44,38 @@ pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, grav
     local_floor_hits
 }
 
-pub fn detect_collisions_chunk(particles : &[Particle], start: usize, end: usize) -> Vec<CollisionPair> {
-    let mut collisions = Vec::new();
+pub fn resolve_collisions_chunk(particles : &[Particle], collision_radius: f32, start: usize, end: usize) -> Vec<Particle> {
+    let mut merged = vec![false; particles.len()];
+    let mut local_particles = Vec::new();
 
     for i in start..end {
+        if merged[i] {
+            continue;
+        }
+
+        let mut current = particles[i];
+
         for j in (i + 1)..particles.len() {
-            if ParticleSystem::are_colliding(&particles[i], &particles[j], 0.01) {
-                collisions.push(CollisionPair { a: i, b: j});
+            if merged[j] {
+                continue;
+            }
+
+            let dx = current.x - particles[j].x;
+            let dy = current.y - particles[j].y;
+
+            if dx * dx + dy * dy <= collision_radius * collision_radius {
+                current = ParticleSystem::merge(&current, &particles[j]);
+                merged[j] = true;
             }
         }
+
+        local_particles.push(current);
     }
-    collisions
+
+    local_particles
 }
 
-fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize, delta_time : f32, gravity : f32, debug_logging : bool)
+fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, debug_logging : bool)
 {
     let mut total = 0.0;
 
@@ -69,7 +88,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
         for step in 0..steps {
             let chunk_size: usize = (ps_clone.particles.len() / num_threads).max(1);   
             let results = Arc::new(Mutex::new(Vec::<usize>::new()));
-            let collision_results = Arc::new(Mutex::new(Vec::<CollisionPair>::new()));
+            let collision_results = Arc::new(Mutex::new(Vec::<Vec<Particle>>::new()));
             let len = ps_clone.particles.len();
             pool.scoped(|scope| {
                 for slice in ps_clone.particles.chunks_mut(chunk_size) 
@@ -95,8 +114,8 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
                     let results = Arc::clone(&collision_results);
 
                     scope.execute(move || {
-                        let local = detect_collisions_chunk(particles, start, end);
-                        results.lock().unwrap().extend(local);
+                        let local = resolve_collisions_chunk(particles, collision_radius, start, end);
+                        results.lock().unwrap().push(local);
                     });
                 }
             });
@@ -105,9 +124,20 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             let total_hits: usize = results.lock().unwrap().iter().sum();
             ps_clone.stats.floor_hits += total_hits;
 
-            let pairs = collision_results.lock().unwrap().clone();
-            
-            ps_clone.resolve_collisions_pairs(pairs);
+            let mut new_particles = Vec::new();
+            let old_count = ps_clone.particles.len();
+
+            for chunk in collision_results.lock().unwrap().iter() {
+                new_particles.extend(chunk.iter().copied());
+            }
+
+            let new_count = new_particles.len();
+            let merges = old_count - new_count;
+
+            ps_clone.particles = new_particles;
+            ps_clone.stats.collision_count += merges;
+            ps_clone.stats.merge_count += merges;
+
             ps_clone.update_temperature();
 
             if debug_logging && step % 20_000 == 0 {
@@ -126,7 +156,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
     println!("Threaded avg time: {:.6} s", total / runs as f64);
 }
 
-fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delta_time : f32, gravity : f32, debug_logging : bool)
+fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, debug_logging : bool)
 {
     let mut total = 0.0;
 
@@ -134,7 +164,7 @@ fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delt
         let mut ps_clone = ps.clone();
 
         let start = Instant::now();
-        ps_clone.simulate_particle_movement(steps, delta_time, gravity, debug_logging);
+        ps_clone.simulate_particle_movement(steps, delta_time, gravity, collision_radius, debug_logging);
         let duration = start.elapsed();
         total += duration.as_secs_f64();
     }
@@ -243,8 +273,7 @@ impl ParticleSystem {
         Particle { x, y, vx, vy, mass }
     }
 
-    pub fn resolve_collisions(&mut self) {
-        const COLLISION_RADIUS: f32 = 0.01;
+    pub fn resolve_collisions(&mut self, collision_radius: f32) {
 
         let mut merged = vec![false; self.particles.len()];
         let mut new_particles: Vec<Particle> = Vec::new();
@@ -261,7 +290,7 @@ impl ParticleSystem {
                     continue;
                 }
 
-                if Self::are_colliding(&current, &self.particles[j], COLLISION_RADIUS) {
+                if Self::are_colliding(&current, &self.particles[j], collision_radius) {
                     self.stats.collision_count += 1;
                     self.stats.merge_count += 1;
                     current = Self::merge(&current, &self.particles[j]);
@@ -305,11 +334,11 @@ impl ParticleSystem {
         // TODO: cooling formula
     }
 
-    pub fn simulate_particle_movement(&mut self, steps: usize, delta_time : f32, gravity : f32, debug_logging : bool)
+    pub fn simulate_particle_movement(&mut self, steps: usize, delta_time : f32, gravity : f32, collision_radius: f32, debug_logging : bool)
     {
         for step in 0..steps{
             self.update_physics(delta_time, gravity);
-            self.resolve_collisions();
+            self.resolve_collisions(collision_radius);
             self.update_temperature();
 
             if debug_logging && step % 20_000 == 0 {
