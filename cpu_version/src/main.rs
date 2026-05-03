@@ -61,24 +61,31 @@ pub fn resolve_collisions_chunk(particles : &[Particle], grid: &Grid, collision_
         }
 
         let mut current = particles[i];
-        let cell = get_cell(&current, collision_radius);
+        let mut changed = true;
 
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let neighbour_cell = (cell.0 + dx, cell.1 + dy);
+        while changed {
+            changed = false;
 
-                if let Some(indices) = grid.get(&neighbour_cell) {
-                    for &j in indices {
-                        if j == i || merged[j] {
-                            continue;
-                        }
+            let cell = get_cell(&current, collision_radius * 2.0);
 
-                        let dx = current.x - particles[j].x;
-                        let dy = current.y - particles[j].y;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    let neighbour_cell = (cell.0 + dx, cell.1 + dy);
 
-                        if dx * dx + dy * dy <= collision_radius * collision_radius {
-                            current = ParticleSystem::merge(&current, &particles[j]);
-                            merged[j] = true;
+                    if let Some(indices) = grid.get(&neighbour_cell) {
+                        for &j in indices {
+                            if j == i || merged[j] {
+                                continue;
+                            }
+
+                            let dx = current.x - particles[j].x;
+                            let dy = current.y - particles[j].y;
+
+                            if dx * dx + dy * dy <= collision_radius * collision_radius {
+                                current = ParticleSystem::merge(&current, &particles[j]);
+                                merged[j] = true;
+                                changed = true;
+                            }
                         }
                     }
                 }
@@ -123,7 +130,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
 
             let old_count = ps_clone.particles.len();
 
-            let grid = ps_clone.build_grid(collision_radius);
+            let grid = ps_clone.build_grid(collision_radius * 2.0);
             let collision_results = Arc::new(Mutex::new(Vec::<Vec<Particle>>::new()));
             
             let len = ps_clone.particles.len();
@@ -335,7 +342,7 @@ impl ParticleSystem {
     pub fn resolve_collisions(&mut self, collision_radius: f32) {
         let old_count = self.particles.len();
 
-        let grid = self.build_grid(collision_radius);
+        let grid = self.build_grid(collision_radius * 2.0);
         let mut merged = vec![false; self.particles.len()];
         let mut new_particles: Vec<Particle> = Vec::new();
 
@@ -350,7 +357,7 @@ impl ParticleSystem {
             while changed {
                 changed = false;    
 
-                let cell = get_cell(&current, collision_radius);
+                let cell = get_cell(&current, collision_radius * 2.0);
 
                 for dx in -1..=1 {
                     for dy in -1..=1 {
