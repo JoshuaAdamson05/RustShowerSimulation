@@ -1,24 +1,31 @@
 use std::{time::Instant};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use rand::{random_range};
 
+type Cell = (i32, i32);
+type Grid = HashMap<Cell, Vec<usize>>;
+
+const WIDTH: f32 = 1.0;
+const HEIGHT: f32 = 2.0;
+const EMITTER_RADIUS: f32 = 0.05;
+
 fn main() {
-    const DEBUG_LOGGING: bool = false;
-    const NUM_PARTICLES: usize = 10_000;
-    const NUM_STEPS: usize = 10_000;
-    const NUM_RUNS: usize = 5;
-    const PHYSICS_THREADS: usize = 2;
+    const DEBUG_LOGGING: bool = true;
+    const NUM_PARTICLES: usize = 100_000;
+    const NUM_STEPS: usize = 100_000;
+    const NUM_RUNS: usize = 3;
+    const NUM_THREADS: usize = 2;
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
-    const COLLISION_RADIUS: f32 = 0.01;
+    const COLLISION_RADIUS: f32 = 0.00001;
+
     let mut ps = ParticleSystem::new();
 
     for _ in 0..NUM_PARTICLES{
-        let x: f32 = random_range(0.0..=10.0);
-        let y: f32 = random_range(0.0..=10.0);
-        let vx: f32 = random_range(-2.0..=2.0);
-        let vy: f32 = random_range(-2.0..=2.0);
+        let (x, y) = random_emitter_position();
+        let vx: f32 = random_range(-0.05..=0.05);
+        let vy: f32 = random_range(-2.0..=-1.0);
         let p = Particle::new(x, y, vx, vy);
         ps.particles.push(p);
     }
@@ -27,7 +34,7 @@ fn main() {
     let ps_threaded = ps.clone();
 
     run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, DEBUG_LOGGING);
-    run_threaded_simulation(ps_threaded, NUM_STEPS, PHYSICS_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, DEBUG_LOGGING);
+    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, DEBUG_LOGGING);
 }
 
 pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, gravity : f32) -> usize {
@@ -44,7 +51,7 @@ pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, grav
     local_floor_hits
 }
 
-pub fn resolve_collisions_chunk(particles : &[Particle], collision_radius: f32, start: usize, end: usize) -> Vec<Particle> {
+pub fn resolve_collisions_chunk(particles : &[Particle], grid: &Grid, collision_radius: f32, start: usize, end: usize) -> Vec<Particle> {
     let mut merged = vec![false; particles.len()];
     let mut local_particles = Vec::new();
 
@@ -54,18 +61,27 @@ pub fn resolve_collisions_chunk(particles : &[Particle], collision_radius: f32, 
         }
 
         let mut current = particles[i];
+        let cell = get_cell(&current, collision_radius);
 
-        for j in (i + 1)..particles.len() {
-            if merged[j] {
-                continue;
-            }
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let neighbour_cell = (cell.0 + dx, cell.1 + dy);
 
-            let dx = current.x - particles[j].x;
-            let dy = current.y - particles[j].y;
+                if let Some(indices) = grid.get(&neighbour_cell) {
+                    for &j in indices {
+                        if j == i || merged[j] {
+                            continue;
+                        }
 
-            if dx * dx + dy * dy <= collision_radius * collision_radius {
-                current = ParticleSystem::merge(&current, &particles[j]);
-                merged[j] = true;
+                        let dx = current.x - particles[j].x;
+                        let dy = current.y - particles[j].y;
+
+                        if dx * dx + dy * dy <= collision_radius * collision_radius {
+                            current = ParticleSystem::merge(&current, &particles[j]);
+                            merged[j] = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -87,13 +103,13 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
 
         for step in 0..steps {
             let chunk_size: usize = (ps_clone.particles.len() / num_threads).max(1);   
-            let results = Arc::new(Mutex::new(Vec::<usize>::new()));
-            let collision_results = Arc::new(Mutex::new(Vec::<Vec<Particle>>::new()));
-            let len = ps_clone.particles.len();
+            let floor_results = Arc::new(Mutex::new(Vec::<usize>::new()));
+
+
             pool.scoped(|scope| {
                 for slice in ps_clone.particles.chunks_mut(chunk_size) 
                 {
-                    let results = Arc::clone(&results);
+                    let results = Arc::clone(&floor_results);
                     scope.execute(move || {
                         let hits = update_particle_chunk(slice, delta_time, gravity);
                         results.lock().unwrap().push(hits);
@@ -101,44 +117,60 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
                 }
             });
 
+            //Combine results
+            let total_hits: usize = floor_results.lock().unwrap().iter().sum();
+            ps_clone.stats.floor_hits += total_hits;
+
+            let old_count = ps_clone.particles.len();
+
+            let grid = ps_clone.build_grid(collision_radius);
+            let collision_results = Arc::new(Mutex::new(Vec::<Vec<Particle>>::new()));
+            
+            let len = ps_clone.particles.len();
+            let collision_chunk_size = (len / num_threads).max(1);
+
             pool.scoped(|scope| {
                 for t in 0..num_threads {
-                    let start = t * chunk_size;
-                    let end = ((t + 1) * chunk_size).min(len);
+                    let start = t * collision_chunk_size;
+                    let end = ((t + 1) * collision_chunk_size).min(len);
 
                     if start >= len {
                         continue;
                     }
 
                     let particles = &ps_clone.particles;
+                    let grid = &grid;
                     let results = Arc::clone(&collision_results);
 
                     scope.execute(move || {
-                        let local = resolve_collisions_chunk(particles, collision_radius, start, end);
+                        let local = resolve_collisions_chunk(particles, grid, collision_radius, start, end);
                         results.lock().unwrap().push(local);
                     });
                 }
             });
 
-            //Combine results
-            let total_hits: usize = results.lock().unwrap().iter().sum();
-            ps_clone.stats.floor_hits += total_hits;
-
             let mut new_particles = Vec::new();
-            let old_count = ps_clone.particles.len();
 
             for chunk in collision_results.lock().unwrap().iter() {
                 new_particles.extend(chunk.iter().copied());
             }
 
-            let new_count = new_particles.len();
-            let merges = old_count - new_count;
-
             ps_clone.particles = new_particles;
-            ps_clone.stats.collision_count += merges;
-            ps_clone.stats.merge_count += merges;
 
-            ps_clone.resolve_collisions(collision_radius);
+            let local_merges = old_count - ps_clone.particles.len();
+            ps_clone.stats.collision_count += local_merges;
+            ps_clone.stats.merge_count += local_merges;
+
+            // Cross-thread merge
+            loop {
+                let before = ps_clone.particles.len();
+                ps_clone.resolve_collisions(collision_radius);
+                let after = ps_clone.particles.len();
+
+                if before == after {
+                    break;
+                }
+            }
 
             ps_clone.update_temperature();
 
@@ -172,6 +204,26 @@ fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delt
     }
     
     println!("Sequential avg time: {:.6} s", total / runs as f64);
+}
+
+fn get_cell(p: &Particle, cell_size: f32) -> Cell {
+    let x = (p.x / cell_size).floor() as i32;
+    let y = (p.y / cell_size).floor() as i32;
+    (x, y)
+}
+
+fn random_emitter_position() -> (f32, f32) {
+    let radius = EMITTER_RADIUS;
+    let centre_x = 0.5;
+    let centre_y = 2.0;
+
+    let r = radius * random_range(0.0..=1.0f32).sqrt();
+    let theta = random_range(0.0..=std::f32::consts::TAU);
+
+    let x = centre_x + r * theta.cos();
+    let y = centre_y;
+
+    (x, y)
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -210,13 +262,13 @@ impl Particle
             self.vx = -self.vx;
         }
 
-        if self.x >= 10.0 {
-            self.x = 10.0;
+        if self.x >= WIDTH {
+            self.x = WIDTH;
             self.vx = -self.vx;
         }
 
-        self.x = self.x.clamp(0.0, 10.0);
-        self.y = self.y.clamp(0.0, 10.0);
+        self.x = self.x.clamp(0.0, WIDTH);
+        self.y = self.y.clamp(0.0, HEIGHT);
     }
 }
 
@@ -253,6 +305,17 @@ impl ParticleSystem {
         }
     }
 
+    fn build_grid(&self, cell_size: f32) -> Grid {
+        let mut grid: Grid = HashMap::new();
+
+        for (i, particle) in self.particles.iter().enumerate() {
+            let cell = get_cell(particle, cell_size);
+            grid.entry(cell).or_default().push(i);
+        }
+
+        grid
+    }
+
     fn are_colliding(a: &Particle, b: &Particle, radius: f32) -> bool {
         let dx = a.x - b.x;
         let dy = a.y - b.y;
@@ -270,7 +333,9 @@ impl ParticleSystem {
     }
 
     pub fn resolve_collisions(&mut self, collision_radius: f32) {
+        let old_count = self.particles.len();
 
+        let grid = self.build_grid(collision_radius);
         let mut merged = vec![false; self.particles.len()];
         let mut new_particles: Vec<Particle> = Vec::new();
 
@@ -280,23 +345,44 @@ impl ParticleSystem {
             }
 
             let mut current = self.particles[i];
+            let mut changed = true;
 
-            for j in (i + 1)..self.particles.len() {
-                if merged[j] {
-                    continue;
-                }
+            while changed {
+                changed = false;    
 
-                if Self::are_colliding(&current, &self.particles[j], collision_radius) {
-                    self.stats.collision_count += 1;
-                    self.stats.merge_count += 1;
-                    current = Self::merge(&current, &self.particles[j]);
-                    merged[j] = true;
+                let cell = get_cell(&current, collision_radius);
+
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let neighbour_cell = (cell.0 + dx, cell.1 + dy);
+
+                        if let Some(indices) = grid.get(&neighbour_cell) {
+                            for &j in indices {
+                                if j == i || merged[j] {
+                                    continue;
+                                }
+
+                                if Self::are_colliding(&current, &self.particles[j], collision_radius)
+                                {
+                                    current = Self::merge(&current, &self.particles[j]);
+                                    merged[j] = true;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
             new_particles.push(current);
         }
         self.particles = new_particles;
+
+        let new_count = self.particles.len();
+        let merges = old_count - new_count;
+
+        self.stats.collision_count += merges;
+        self.stats.merge_count += merges;
     }
 
     pub fn update_temperature(&mut self) {
@@ -320,10 +406,12 @@ impl ParticleSystem {
 
     pub fn respawn_particle(p: &mut Particle)
     {
-        p.x = random_range(0.45..=0.55);
-        p.y = 2.0;
+        let (x, y) = random_emitter_position();
+        p.x = x;
+        p.y = y;
 
-        p.vx = random_range(-2.0..=2.0);
-        p.vy = random_range(-5.0..=-1.0);
+        p.vx = random_range(-0.05..=0.05);
+        p.vy = random_range(-2.0..=-1.0);
+        p.mass = 1.0;
     }
  }
