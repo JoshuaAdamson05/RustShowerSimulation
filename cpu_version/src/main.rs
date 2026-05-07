@@ -17,6 +17,10 @@ fn main() {
 
 fn run_visualisation() {
     const NUM_PARTICLES: usize = 100_000;
+    const PHYSICS_THREADS: usize = 2;
+    const COLLISION_THREADS: usize = 2;
+    const TEMPERATURE_THREADS: usize = 2;
+
     const DELTA_TIME: f32 = 1.0 / 60.0;
     const GRAVITY: f32 = -9.81;
     const COLLISION_RADIUS: f32 = 0.001;
@@ -75,7 +79,17 @@ fn run_visualisation() {
         ps.particles.push(Particle::new(x, y, vx, vy));
     }
 
-    let mut render_mode = RenderMode::Mass;
+    let mut physics_pool =
+        scoped_threadpool::Pool::new(PHYSICS_THREADS as u32);
+
+    let mut collision_pool =
+        scoped_threadpool::Pool::new(COLLISION_THREADS as u32);
+
+    let mut temperature_pool =
+        scoped_threadpool::Pool::new(TEMPERATURE_THREADS as u32);
+
+    let mut render_mode = RenderMode::Thermal;
+    let mut frame_step: usize = 0;
 
     #[allow(deprecated)]
     event_loop
@@ -104,9 +118,9 @@ fn run_visualisation() {
                         }
 
                         glium::winit::event::WindowEvent::RedrawRequested => {
-                            ps.update_physics(DELTA_TIME, GRAVITY);
-                            ps.resolve_collisions(COLLISION_RADIUS);
-                            ps.update_temperature(DELTA_TIME, COOLING_FACTOR);
+                            threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, frame_step);
+
+                            frame_step += 1;
 
                             // Particles
                             let particle_vertices = particles_to_vertices(&ps.particles, &render_mode, RENDER_STRIDE);
@@ -164,6 +178,111 @@ fn run_visualisation() {
             }
         })
         .unwrap();
+}
+
+pub fn threaded_simulation_step(
+    ps: &mut ParticleSystem,
+    physics_pool: &mut scoped_threadpool::Pool,
+    collision_pool: &mut scoped_threadpool::Pool,
+    temperature_pool: &mut scoped_threadpool::Pool,
+    physics_threads: usize,
+    collision_threads: usize,
+    temperature_threads: usize,
+    delta_time: f32,
+    gravity: f32,
+    collision_radius: f32,
+    cooling_factor: f32,
+    step: usize,
+) {
+    let chunk_size = (ps.particles.len() / physics_threads).max(1);
+    let mut floor_outputs = vec![0usize; physics_threads];
+
+    physics_pool.scoped(|scope| {
+        for (slice, output) in ps
+            .particles
+            .chunks_mut(chunk_size)
+            .zip(floor_outputs.iter_mut())
+        {
+            scope.execute(move || {
+                *output = update_particle_chunk(slice, delta_time, gravity);
+            });
+        }
+    });
+
+    let total_hits: usize = floor_outputs.iter().sum();
+    ps.stats.floor_hits += total_hits;
+
+    let old_count = ps.particles.len();
+
+    let grid = ps.build_grid(collision_radius * 2.0);
+    let len = ps.particles.len();
+
+    let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
+
+    for &cell in grid.keys() {
+        let owner = cell_owner(cell, collision_threads);
+        owned_cells[owner].push(cell);
+    }
+
+    let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); collision_threads];
+
+    collision_pool.scoped(|scope| {
+        for (t, output) in collision_outputs.iter_mut().enumerate() {
+            let cells = &owned_cells[t];
+
+            if cells.is_empty() {
+                continue;
+            }
+
+            let particles = &ps.particles;
+            let grid = &grid;
+
+            scope.execute(move || {
+                let local = resolve_owned_grid_cells(
+                    particles,
+                    grid,
+                    cells,
+                    collision_radius,
+                );
+
+                *output = local;
+            });
+        }
+    });
+
+    let mut new_particles = Vec::with_capacity(len);
+
+    for output in collision_outputs {
+        new_particles.extend(output);
+    }
+
+    ps.particles = new_particles;
+
+    let local_merges = old_count - ps.particles.len();
+    ps.stats.collision_count += local_merges;
+    ps.stats.merge_count += local_merges;
+
+    if step % 100 == 0 {
+        loop {
+            let before = ps.particles.len();
+            ps.resolve_collisions(collision_radius);
+            let after = ps.particles.len();
+
+            if before == after {
+                break;
+            }
+        }
+    }
+
+    let temp_chunk_size = (ps.particles.len() / temperature_threads).max(1);
+
+    temperature_pool.scoped(|scope| {
+        for slice in ps.particles.chunks_mut(temp_chunk_size) {
+            scope.execute(move || {
+                update_temperature_chunk(slice, delta_time, cooling_factor);
+            });
+        }
+    });
 }
 
 fn run_benchmarks(){
