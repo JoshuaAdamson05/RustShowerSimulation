@@ -17,16 +17,16 @@ fn main() {
 }
 
 fn run_visualisation() {
-    const NUM_PARTICLES: usize = 100_000;
+    const NUM_PARTICLES: usize = 200_000;
     const PHYSICS_THREADS: usize = 2;
     const COLLISION_THREADS: usize = 2;
     const TEMPERATURE_THREADS: usize = 2;
 
     const DELTA_TIME: f32 = 1.0 / 60.0;
     const GRAVITY: f32 = -9.81;
-    const COLLISION_RADIUS: f32 = 0.001;
+    const COLLISION_RADIUS: f32 = 0.0001;
     const COOLING_FACTOR: f32 = 1.0;
-    const RENDER_STRIDE: usize = 5;
+    const RENDER_STRIDE: usize = 100;
 
     let event_loop = glium::winit::event_loop::EventLoop::builder()
         .build()
@@ -136,6 +136,11 @@ fn run_visualisation() {
 
                         glium::winit::event::WindowEvent::RedrawRequested => {
                             threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, frame_step);
+
+                            if frame_step % 300 == 0 {
+                                println!("Floor Hits: {} | Particles {} | Avg Temp: {:.3}",
+                                ps.stats.floor_hits, ps.particles.len(), ps.average_temperature())
+                            }
 
                             frame_step += 1;
 
