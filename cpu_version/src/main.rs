@@ -14,7 +14,9 @@ fn main() {
     const NUM_PARTICLES: usize = 100_000;
     const NUM_STEPS: usize = 100_000;
     const NUM_RUNS: usize = 3;
-    const NUM_THREADS: usize = 2;
+    const PHYSICS_THREADS: usize = 2;
+    const COLLISION_THREADS: usize = 2;
+    const TEMPERATURE_THREADS: usize = 2;
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
     const COLLISION_RADIUS: f32 = 0.0001;
@@ -34,7 +36,7 @@ fn main() {
     let ps_threaded = ps.clone();
 
     run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, DEBUG_LOGGING);
-    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, DEBUG_LOGGING);
+    run_threaded_simulation(ps_threaded, NUM_STEPS, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, DEBUG_LOGGING);
 }
 
 pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, gravity : f32) -> usize {
@@ -107,21 +109,23 @@ pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cell
     local_particles
 }
 
-fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, cooling_factor : f32, debug_logging : bool)
+fn run_threaded_simulation(ps: ParticleSystem, steps: usize, physics_threads: usize, collision_threads: usize, temperature_threads: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, cooling_factor : f32, debug_logging : bool)
 {
     let mut total = 0.0;
 
     for _ in 0..runs {
         let mut ps_clone = ps.clone();      
-        let mut pool = scoped_threadpool::Pool::new(num_threads as u32);
+        let mut physics_pool = scoped_threadpool::Pool::new(physics_threads as u32);
+        let mut collision_pool = scoped_threadpool::Pool::new(collision_threads as u32);
+        let mut temeperature_pool = scoped_threadpool::Pool::new(temperature_threads as u32);
 
         let start = Instant::now();
 
         for step in 0..steps {
-            let chunk_size: usize = (ps_clone.particles.len() / num_threads).max(1);   
-            let mut floor_outputs = vec![0usize; num_threads];
+            let chunk_size: usize = (ps_clone.particles.len() / physics_threads).max(1);   
+            let mut floor_outputs = vec![0usize; physics_threads];
 
-            pool.scoped(|scope| {
+            physics_pool.scoped(|scope| {
                 for (slice, output) in ps_clone.particles.chunks_mut(chunk_size).zip(floor_outputs.iter_mut()) {
                     scope.execute(move || {
                         *output = update_particle_chunk(slice, delta_time, gravity);
@@ -136,17 +140,17 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             let old_count = ps_clone.particles.len();
 
             let grid = ps_clone.build_grid(collision_radius * 2.0);
-            let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); num_threads];
+            let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); physics_threads];
             
             let len = ps_clone.particles.len();
-            let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); num_threads];
+            let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); physics_threads];
 
             for &cell in grid.keys() {
-                let owner = cell_owner(cell, num_threads);
+                let owner = cell_owner(cell, physics_threads);
                 owned_cells[owner].push(cell);
             }
 
-            pool.scoped(|scope| {
+            collision_pool.scoped(|scope| {
                 for (t, output) in collision_outputs.iter_mut().enumerate() {
                     let cells = &owned_cells[t];
 
@@ -190,9 +194,9 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
                 }
             }
 
-            let temp_chunk_size = (ps_clone.particles.len() / num_threads).max(1);
+            let temp_chunk_size = (ps_clone.particles.len() / physics_threads).max(1);
 
-            pool.scoped(|scope| {
+            temeperature_pool.scoped(|scope| {
                 for slice in ps_clone.particles.chunks_mut(temp_chunk_size) {
                     scope.execute(move || {
                         update_temperature_chunk(slice, delta_time, cooling_factor);
