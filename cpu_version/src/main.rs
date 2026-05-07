@@ -10,7 +10,7 @@ const HEIGHT: f32 = 2.0;
 const EMITTER_RADIUS: f32 = 0.05;
 
 fn main() {
-    const DEBUG_LOGGING: bool = false;
+    const DEBUG_LOGGING: bool = true;
     const NUM_PARTICLES: usize = 100_000;
     const NUM_STEPS: usize = 100_000;
     const NUM_RUNS: usize = 3;
@@ -18,6 +18,7 @@ fn main() {
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
     const COLLISION_RADIUS: f32 = 0.0001;
+    const COOLING_FACTOR: f32 = 0.5;
 
     let mut ps = ParticleSystem::new();
 
@@ -32,8 +33,8 @@ fn main() {
     let ps_sequential = ps.clone();
     let ps_threaded = ps.clone();
 
-    run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, DEBUG_LOGGING);
-    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, DEBUG_LOGGING);
+    run_sequential_simulation(ps_sequential, NUM_STEPS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, DEBUG_LOGGING);
+    run_threaded_simulation(ps_threaded, NUM_STEPS, NUM_THREADS, NUM_RUNS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, DEBUG_LOGGING);
 }
 
 pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, gravity : f32) -> usize {
@@ -48,6 +49,12 @@ pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, grav
         }
     }
     local_floor_hits
+}
+
+pub fn update_temperature_chunk(particles : &mut [Particle], delta_time : f32, cooling_factor : f32) {
+    for particle in particles {
+        particle.update_temperature(delta_time, cooling_factor);
+    }
 }
 
 pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cells: &[Cell], collision_radius: f32) -> Vec<Particle> {
@@ -100,7 +107,7 @@ pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cell
     local_particles
 }
 
-fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, debug_logging : bool)
+fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, cooling_factor : f32, debug_logging : bool)
 {
     let mut total = 0.0;
 
@@ -183,13 +190,21 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
                 }
             }
 
-            ps_clone.update_temperature();
+            let temp_chunk_size = (ps_clone.particles.len() / num_threads).max(1);
+
+            pool.scoped(|scope| {
+                for slice in ps_clone.particles.chunks_mut(temp_chunk_size) {
+                    scope.execute(move || {
+                        update_temperature_chunk(slice, delta_time, cooling_factor);
+                    });
+                }
+            });
 
             if debug_logging && step % 20_000 == 0 {
                 println!(
-                    "Threaded Step: {}, Particles: {}, Floor Hits: {}, Collisions: {}, Merges: {}",
+                    "Threaded Step: {}, Particles: {}, Floor Hits: {}, Collisions: {}, Merges: {}, Avg Temp: {:.3}, Min Temp: {:.3}",
                     step, ps_clone.particles.len(), ps_clone.stats.floor_hits, ps_clone.stats.collision_count,
-                    ps_clone.stats.merge_count
+                    ps_clone.stats.merge_count, ps_clone.average_temperature(), ps_clone.min_temperature()
                 );
             }
         }
@@ -201,7 +216,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
     println!("Threaded avg time: {:.6} s", total / runs as f64);
 }
 
-fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, debug_logging : bool)
+fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, cooling_factor : f32, debug_logging : bool)
 {
     let mut total = 0.0;
 
@@ -209,7 +224,7 @@ fn run_sequential_simulation(ps: ParticleSystem, steps: usize, runs: usize, delt
         let mut ps_clone = ps.clone();
 
         let start = Instant::now();
-        ps_clone.simulate_particle_movement(steps, delta_time, gravity, collision_radius, debug_logging);
+        ps_clone.simulate_particle_movement(steps, delta_time, gravity, collision_radius, cooling_factor, debug_logging);
         let duration = start.elapsed();
         total += duration.as_secs_f64();
     }
@@ -248,7 +263,8 @@ pub struct Particle {
     y: f32,
     vx: f32,
     vy: f32,
-    mass: f32
+    mass: f32,
+    temperature: f32
 }
 
 impl Particle
@@ -259,7 +275,8 @@ impl Particle
             y: y_variable,
             vx: vx_variable,
             vy: vy_variable,
-            mass: 1.0
+            mass: 1.0,
+            temperature: 1.0
         }
     }
 
@@ -285,6 +302,11 @@ impl Particle
 
         self.x = self.x.clamp(0.0, WIDTH);
         self.y = self.y.clamp(0.0, HEIGHT);
+    }
+
+    pub fn update_temperature(&mut self, delta_time : f32, cooling_factor: f32) {
+        self.temperature -= (delta_time * cooling_factor) / self.mass;
+        self.temperature = self.temperature.clamp(0.0, 1.0);
     }
 }
 
@@ -321,6 +343,26 @@ impl ParticleSystem {
         }
     }
 
+    pub fn update_temperature(&mut self, delta_time : f32, cooling_factor : f32) {
+        for particle in &mut self.particles {
+            particle.update_temperature(delta_time, cooling_factor);
+        }
+    }
+
+    pub fn average_temperature(&self) -> f32 {
+        if self.particles.is_empty() {
+            return 0.0;
+        }
+
+        let total: f32 = self.particles.iter().map(|p| p.temperature).sum();
+
+        total / self.particles.len() as f32
+    }
+
+    pub fn min_temperature(&self) -> f32 {
+        self.particles.iter().map(|p| p.temperature).fold(1.0, f32::min)
+    }
+
     fn build_grid(&self, cell_size: f32) -> Grid {
         let mut grid: Grid = HashMap::new();
 
@@ -344,8 +386,8 @@ impl ParticleSystem {
         let vy = (a.mass * a.vy + b.mass * b.vy) / mass;
         let x = (a.x * a.mass + b.x * b.mass) / mass;
         let y = (a.y * a.mass + b.y * b.mass) / mass;
-
-        Particle { x, y, vx, vy, mass }
+        let temperature = (a.temperature * a.mass + b.temperature * b.mass) / mass;
+        Particle { x, y, vx, vy, mass, temperature }
     }
 
     pub fn resolve_collisions(&mut self, collision_radius: f32) {
@@ -401,21 +443,17 @@ impl ParticleSystem {
         self.stats.merge_count += merges;
     }
 
-    pub fn update_temperature(&mut self) {
-        // TODO: cooling formula
-    }
-
-    pub fn simulate_particle_movement(&mut self, steps: usize, delta_time : f32, gravity : f32, collision_radius: f32, debug_logging : bool)
+    pub fn simulate_particle_movement(&mut self, steps: usize, delta_time : f32, gravity : f32, collision_radius: f32, cooling_factor : f32, debug_logging : bool)
     {
         for step in 0..steps{
             self.update_physics(delta_time, gravity);
             self.resolve_collisions(collision_radius);
-            self.update_temperature();
+            self.update_temperature(delta_time, cooling_factor);
 
             if debug_logging && step % 20_000 == 0 {
-                println!("Step: {}, Particles: {}, Floor Hits: {}, Collisions: {}, Merges: {}", 
+                println!("Step: {}, Particles: {}, Floor Hits: {}, Collisions: {}, Merges: {}, Avg Temp: {:.3}, Min Temp: {:.3}", 
                 step, self.particles.len(), self.stats.floor_hits, self.stats.collision_count, 
-                self.stats.merge_count);
+                self.stats.merge_count, self.average_temperature(), self.min_temperature());
             }
         }
     }
@@ -429,5 +467,6 @@ impl ParticleSystem {
         p.vx = random_range(-0.05..=0.05);
         p.vy = random_range(-2.0..=-1.0);
         p.mass = 1.0;
+        p.temperature = 1.0;
     }
  }
