@@ -1,5 +1,4 @@
 use std::{time::Instant};
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use rand::{random_range};
 
@@ -15,7 +14,7 @@ fn main() {
     const NUM_PARTICLES: usize = 100_000;
     const NUM_STEPS: usize = 100_000;
     const NUM_RUNS: usize = 3;
-    const NUM_THREADS: usize = 3;
+    const NUM_THREADS: usize = 2;
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
     const COLLISION_RADIUS: f32 = 0.0001;
@@ -51,48 +50,51 @@ pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, grav
     local_floor_hits
 }
 
-pub fn resolve_collisions_chunk(particles : &[Particle], grid: &Grid, collision_radius: f32, start: usize, end: usize) -> Vec<Particle> {
+pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cells: &[Cell], collision_radius: f32) -> Vec<Particle> {
     let mut merged = vec![false; particles.len()];
     let mut local_particles = Vec::new();
 
-    for i in start..end {
-        if merged[i] {
-            continue;
-        }
+    for &cell in owned_cells {
+        if let Some(indices) = grid.get(&cell) {
+            for &i in indices {
+                if merged[i] {
+                    continue;
+                }
 
-        let mut current = particles[i];
-        let mut changed = true;
+                let mut current = particles[i];
+                let mut changed = true;
 
-        while changed {
-            changed = false;
+                while changed {
+                    changed = false;
+                    let current_cell = get_cell(&current, collision_radius * 2.0);
 
-            let cell = get_cell(&current, collision_radius * 2.0);
+                    for dx in -1..=1 {
+                        for dy in -1..=1 {
+                            let neighbor_cell = (current_cell.0 + dx, current_cell.1 + dy);
 
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    let neighbour_cell = (cell.0 + dx, cell.1 + dy);
+                            if let Some(neighbor_indices) = grid.get(&neighbor_cell) {
+                                for &j in neighbor_indices {
+                                    if j == i || merged[j] {
+                                        continue;
+                                    }
 
-                    if let Some(indices) = grid.get(&neighbour_cell) {
-                        for &j in indices {
-                            if j == i || merged[j] {
-                                continue;
-                            }
+                                    let dx = current.x - particles[j].x;
+                                    let dy = current.y - particles[j].y;
 
-                            let dx = current.x - particles[j].x;
-                            let dy = current.y - particles[j].y;
-
-                            if dx * dx + dy * dy <= collision_radius * collision_radius {
-                                current = ParticleSystem::merge(&current, &particles[j]);
-                                merged[j] = true;
-                                changed = true;
+                                    if dx * dx + dy * dy <= collision_radius * collision_radius {
+                                        current = ParticleSystem::merge(&current, &particles[j]);
+                                        merged[j] = true;
+                                        changed = true;
+                                    }
+                                }
                             }
                         }
                     }
                 }
+
+                local_particles.push(current);
             }
         }
-
-        local_particles.push(current);
     }
 
     local_particles
@@ -110,22 +112,18 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
 
         for step in 0..steps {
             let chunk_size: usize = (ps_clone.particles.len() / num_threads).max(1);   
-            let floor_results = Arc::new(Mutex::new(Vec::<usize>::new()));
-
+            let mut floor_outputs = vec![0usize; num_threads];
 
             pool.scoped(|scope| {
-                for slice in ps_clone.particles.chunks_mut(chunk_size) 
-                {
-                    let results = Arc::clone(&floor_results);
+                for (slice, output) in ps_clone.particles.chunks_mut(chunk_size).zip(floor_outputs.iter_mut()) {
                     scope.execute(move || {
-                        let hits = update_particle_chunk(slice, delta_time, gravity);
-                        results.lock().unwrap().push(hits);
+                        *output = update_particle_chunk(slice, delta_time, gravity)
                     });
                 }
             });
 
             //Combine results
-            let total_hits: usize = floor_results.lock().unwrap().iter().sum();
+            let total_hits: usize = floor_outputs.iter().sum();
             ps_clone.stats.floor_hits += total_hits;
 
             let old_count = ps_clone.particles.len();
@@ -134,14 +132,18 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); num_threads];
             
             let len = ps_clone.particles.len();
-            let collision_chunk_size = (len / num_threads).max(1);
+            let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); num_threads];
+
+            for &cell in grid.keys() {
+                let owner = cell_owner(cell, num_threads);
+                owned_cells[owner].push(cell);
+            }
 
             pool.scoped(|scope| {
                 for (t, output) in collision_outputs.iter_mut().enumerate() {
-                    let start = t * collision_chunk_size;
-                    let end = ((t + 1) * collision_chunk_size).min(len);
+                    let cells = &owned_cells[t];
 
-                    if start >= len {
+                    if cells.is_empty() {
                         continue;
                     }
 
@@ -149,7 +151,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
                     let grid = &grid;
 
                     scope.execute(move || {
-                        let local = resolve_collisions_chunk(particles, grid, collision_radius, start, end);
+                        let local = resolve_owned_grid_cells(particles, grid, cells, collision_radius);
 
                     *output = local;
                     });
@@ -169,13 +171,15 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             ps_clone.stats.merge_count += local_merges;
 
             // Cross-thread merge
-            loop {
-                let before = ps_clone.particles.len();
-                ps_clone.resolve_collisions(collision_radius);
-                let after = ps_clone.particles.len();
+            if step % 100 == 0 {
+                loop {
+                    let before = ps_clone.particles.len();
+                    ps_clone.resolve_collisions(collision_radius);
+                    let after = ps_clone.particles.len();
 
-                if before == after {
-                    break;
+                    if before == after {
+                        break;
+                    }
                 }
             }
 
@@ -231,6 +235,11 @@ fn random_emitter_position() -> (f32, f32) {
     let y = centre_y;
 
     (x, y)
+}
+
+fn cell_owner(cell: Cell, num_threads: usize) -> usize {
+    let hash = cell.0.wrapping_mul(73856093) ^ cell.1.wrapping_mul(19349663);
+    (hash.abs() as usize) % num_threads
 }
 
 #[derive(Debug, Copy, Clone)]
