@@ -1,9 +1,172 @@
 use std::{time::Instant};
-use rand::{random_range};
+use glium::{Surface, backend::glutin::SimpleWindowBuilder};
 mod simulation;
+mod renderer;
 use simulation::*;
+use renderer::*;
 
 fn main() {
+    const VISUAL_MODE: bool = true;
+
+    if VISUAL_MODE {
+        run_visualisation();
+    } else {
+        run_benchmarks();
+    }
+}
+
+fn run_visualisation() {
+    const NUM_PARTICLES: usize = 100_000;
+    const DELTA_TIME: f32 = 1.0 / 60.0;
+    const GRAVITY: f32 = -9.81;
+    const COLLISION_RADIUS: f32 = 0.001;
+    const COOLING_FACTOR: f32 = 1.0;
+    const RENDER_STRIDE: usize = 5;
+
+    let event_loop = glium::winit::event_loop::EventLoop::builder()
+        .build()
+        .unwrap();
+
+    let (window, display) = SimpleWindowBuilder::new()
+        .with_title("Particle Shower Simulation")
+        .with_inner_size(900, 700)
+        .build(&event_loop);
+
+    let vertex_shader_src = r#"
+        #version 140
+
+        in vec2 position;
+        in vec3 colour;
+
+        out vec3 v_colour;
+
+        void main() {
+            v_colour = colour;
+            gl_Position = vec4(position, 0.0, 1.0);
+            gl_PointSize = 100.0;
+        }
+    "#;
+
+    let fragment_shader_src = r#"
+        #version 140
+
+        in vec3 v_colour;
+        out vec4 color;
+
+        void main() {
+            color = vec4(v_colour, 1.0);
+        }
+    "#;
+
+    let program = glium::Program::from_source(&display, vertex_shader_src, fragment_shader_src, None)
+        .unwrap();
+
+    let mut ps = ParticleSystem::new();
+
+    let speed = 2.0;
+    for _ in 0..NUM_PARTICLES {
+        let (x, y) = random_emitter_position();
+
+        let angle_deg: f32 = rand::random_range(-30.0..=30.0);
+        let angle_rad = angle_deg.to_radians();
+
+        let vx = speed * angle_rad.sin();
+        let vy = speed * angle_rad.cos();
+        ps.particles.push(Particle::new(x, y, vx, vy));
+    }
+
+    let mut render_mode = RenderMode::Mass;
+
+    #[allow(deprecated)]
+    event_loop
+        .run(move |event, window_target| {
+            match event {
+                glium::winit::event::Event::WindowEvent { event, .. } => {
+                    match event {
+                        glium::winit::event::WindowEvent::CloseRequested => {
+                            window_target.exit();
+                        }
+
+                        glium::winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                            use glium::winit::keyboard::{KeyCode, PhysicalKey};
+
+                            if event.state == glium::winit::event::ElementState::Pressed {
+                                match event.physical_key {
+                                    PhysicalKey::Code(KeyCode::KeyT) => {
+                                        render_mode = RenderMode::Thermal;
+                                    }
+                                    PhysicalKey::Code(KeyCode::KeyM) => {
+                                        render_mode = RenderMode::Mass;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        glium::winit::event::WindowEvent::RedrawRequested => {
+                            ps.update_physics(DELTA_TIME, GRAVITY);
+                            ps.resolve_collisions(COLLISION_RADIUS);
+                            ps.update_temperature(DELTA_TIME, COOLING_FACTOR);
+
+                            // Particles
+                            let particle_vertices = particles_to_vertices(&ps.particles, &render_mode, RENDER_STRIDE);
+
+                            let particles_vertex_buffer = glium::VertexBuffer::new(&display, &particle_vertices).unwrap();
+
+                            let particle_indices = glium::index::NoIndices(glium::index::PrimitiveType::Points);
+
+                            // Cubicle
+                            let cubicle_vertices = cubicle_vertices();
+
+                            let cubicle_buffer = glium::VertexBuffer::new(&display, &cubicle_vertices).unwrap();
+                            
+                            let cubicle_indices = glium::index::NoIndices(glium::index::PrimitiveType::LinesList);
+
+                            // Shower Head
+                            let shower_vertices = shower_head_vertices();
+
+                            let shower_buffer = glium::VertexBuffer::new(&display, &shower_vertices).unwrap();
+
+                            let shower_indices = glium::index::NoIndices(glium::index::PrimitiveType::LineLoop);
+
+                            let mut frame = display.draw();
+
+                        frame.clear_color(0.02, 0.02, 0.02, 1.0);
+
+                        let particle_draw_params = glium::DrawParameters {
+                            point_size: Some(10.0),
+                            ..Default::default()
+                        };
+
+                        let line_draw_params = glium::DrawParameters {
+                            line_width: Some(4.0),
+                            ..Default::default()
+                        };
+
+                        frame.draw(&particles_vertex_buffer, &particle_indices, &program, &glium::uniforms::EmptyUniforms, &particle_draw_params).unwrap();
+
+                        frame.draw(&cubicle_buffer, &cubicle_indices, &program, &glium::uniforms::EmptyUniforms, &line_draw_params).unwrap();
+
+                        frame.draw(&shower_buffer, &shower_indices, &program, &glium::uniforms::EmptyUniforms, &line_draw_params).unwrap();
+
+                        frame.finish().unwrap();
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                glium::winit::event::Event::AboutToWait => {
+                    window.request_redraw();
+                }
+
+                _ => {}
+            }
+        })
+        .unwrap();
+}
+
+fn run_benchmarks(){
     const DEBUG_LOGGING: bool = false;
     const NUM_PARTICLES: usize = 100_000;
     const NUM_STEPS: usize = 100_000;
@@ -14,16 +177,20 @@ fn main() {
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
     const COLLISION_RADIUS: f32 = 0.0001;
-    const COOLING_FACTOR: f32 = 0.5;
+    const COOLING_FACTOR: f32 = 1.0;
 
     let mut ps = ParticleSystem::new();
 
-    for _ in 0..NUM_PARTICLES{
+    let speed = 2.0;
+    for _ in 0..NUM_PARTICLES {
         let (x, y) = random_emitter_position();
-        let vx: f32 = random_range(-0.05..=0.05);
-        let vy: f32 = random_range(-2.0..=-1.0);
-        let p = Particle::new(x, y, vx, vy);
-        ps.particles.push(p);
+
+        let angle_deg: f32 = rand::random_range(-30.0..=30.0);
+        let angle_rad = angle_deg.to_radians();
+
+        let vx = speed * angle_rad.sin();
+        let vy = speed * angle_rad.cos();
+        ps.particles.push(Particle::new(x, y, vx, vy));
     }
 
     let ps_sequential = ps.clone();
@@ -137,10 +304,10 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, physics_threads: us
             let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); physics_threads];
             
             let len = ps_clone.particles.len();
-            let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); physics_threads];
+            let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
 
             for &cell in grid.keys() {
-                let owner = cell_owner(cell, physics_threads);
+                let owner = cell_owner(cell, collision_threads);
                 owned_cells[owner].push(cell);
             }
 

@@ -215,8 +215,12 @@ impl ParticleSystem {
         p.x = x;
         p.y = y;
 
-        p.vx = random_range(-0.05..=0.05);
-        p.vy = random_range(-2.0..=-1.0);
+        let speed = 2.0;
+        let angle_deg: f32 = random_range(-30.0..=30.0);
+        let angle_rad = angle_deg.to_radians();
+
+        p.vx = speed * angle_rad.sin();
+        p.vy = -speed * angle_rad.cos();
         p.mass = 1.0;
         p.temperature = 1.0;
     }
@@ -231,8 +235,8 @@ pub fn get_cell(p: &Particle, cell_size: f32) -> Cell {
 
 pub fn random_emitter_position() -> (f32, f32) {
     let radius = EMITTER_RADIUS;
-    let centre_x = 0.5;
-    let centre_y = 2.0;
+    let centre_x = WIDTH / 2.0;
+    let centre_y = HEIGHT;
 
     let r = radius * random_range(0.0..=1.0f32).sqrt();
     let theta = random_range(0.0..=std::f32::consts::TAU);
