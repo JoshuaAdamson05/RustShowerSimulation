@@ -10,7 +10,7 @@ const HEIGHT: f32 = 2.0;
 const EMITTER_RADIUS: f32 = 0.05;
 
 fn main() {
-    const DEBUG_LOGGING: bool = true;
+    const DEBUG_LOGGING: bool = false;
     const NUM_PARTICLES: usize = 100_000;
     const NUM_STEPS: usize = 100_000;
     const NUM_RUNS: usize = 3;
@@ -124,7 +124,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             pool.scoped(|scope| {
                 for (slice, output) in ps_clone.particles.chunks_mut(chunk_size).zip(floor_outputs.iter_mut()) {
                     scope.execute(move || {
-                        *output = update_particle_chunk(slice, delta_time, gravity)
+                        *output = update_particle_chunk(slice, delta_time, gravity);
                     });
                 }
             });
@@ -158,7 +158,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
                     let grid = &grid;
 
                     scope.execute(move || {
-                        let local = resolve_owned_grid_cells(particles, grid, cells, collision_radius);
+                    let local = resolve_owned_grid_cells(particles, grid, cells, collision_radius);
 
                     *output = local;
                     });
