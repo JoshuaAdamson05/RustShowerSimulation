@@ -1,4 +1,5 @@
 use std::{time::Instant};
+use cgmath::{perspective, Matrix4, Point3, Rad, Vector3};
 use glium::{Surface, backend::glutin::SimpleWindowBuilder};
 mod simulation;
 mod renderer;
@@ -39,19 +40,37 @@ fn run_visualisation() {
     let vertex_shader_src = r#"
         #version 140
 
-        in vec2 position;
+        in vec3 position;
         in vec3 colour;
 
         out vec3 v_colour;
 
+        uniform mat4 matrix;
+
         void main() {
             v_colour = colour;
-            gl_Position = vec4(position, 0.0, 1.0);
-            gl_PointSize = 100.0;
+            gl_Position = matrix * vec4(position, 1.0);
+            gl_PointSize = 10.0;
         }
     "#;
 
-    let fragment_shader_src = r#"
+    let particle_fragment_shader_src = r#"
+        #version 140
+
+        in vec3 v_colour;
+        out vec4 color;
+
+        void main() {
+            vec2 coord = gl_PointCoord - vec2(0.5);
+
+            if(length(coord) > 0.5)
+                discard;
+
+            color = vec4(v_colour, 1.0);
+        }
+    "#;
+
+    let line_fragment_shader_src = r#"
         #version 140
 
         in vec3 v_colour;
@@ -62,21 +81,19 @@ fn run_visualisation() {
         }
     "#;
 
-    let program = glium::Program::from_source(&display, vertex_shader_src, fragment_shader_src, None)
+    let particle_program = glium::Program::from_source(&display, vertex_shader_src, particle_fragment_shader_src, None)
+        .unwrap();
+
+    let line_program = glium::Program::from_source(&display, vertex_shader_src, line_fragment_shader_src, None)
         .unwrap();
 
     let mut ps = ParticleSystem::new();
 
-    let speed = 2.0;
     for _ in 0..NUM_PARTICLES {
-        let (x, y) = random_emitter_position();
+        let (x, y, z) = random_emitter_position();
+        let (vx, vy, vz) = random_cone_velocity();
 
-        let angle_deg: f32 = rand::random_range(-30.0..=30.0);
-        let angle_rad = angle_deg.to_radians();
-
-        let vx = speed * angle_rad.sin();
-        let vy = speed * angle_rad.cos();
-        ps.particles.push(Particle::new(x, y, vx, vy));
+        ps.particles.push(Particle::new(x, y, z, vx, vy, vz));
     }
 
     let mut physics_pool =
@@ -141,14 +158,14 @@ fn run_visualisation() {
 
                             let shower_buffer = glium::VertexBuffer::new(&display, &shower_vertices).unwrap();
 
-                            let shower_indices = glium::index::NoIndices(glium::index::PrimitiveType::LineLoop);
+                            let shower_indices = glium::index::NoIndices(glium::index::PrimitiveType::TriangleFan);
 
                             let mut frame = display.draw();
 
-                        frame.clear_color(0.02, 0.02, 0.02, 1.0);
+                        frame.clear_color_and_depth((0.02, 0.02, 0.02, 1.0), 1.0);
 
                         let particle_draw_params = glium::DrawParameters {
-                            point_size: Some(10.0),
+                            point_size: Some(14.0),
                             ..Default::default()
                         };
 
@@ -157,11 +174,21 @@ fn run_visualisation() {
                             ..Default::default()
                         };
 
-                        frame.draw(&particles_vertex_buffer, &particle_indices, &program, &glium::uniforms::EmptyUniforms, &particle_draw_params).unwrap();
+                        let perspective_matrix: Matrix4<f32> = perspective(Rad(std::f32::consts::FRAC_PI_4), 900.0 / 700.0, 0.1, 100.0);
 
-                        frame.draw(&cubicle_buffer, &cubicle_indices, &program, &glium::uniforms::EmptyUniforms, &line_draw_params).unwrap();
+                        let view_matrix = Matrix4::look_to_rh(Point3::new(1.5, 1.2, 3.0), Vector3::new(-1.5, -1.2, -3.0), Vector3::unit_y());
 
-                        frame.draw(&shower_buffer, &shower_indices, &program, &glium::uniforms::EmptyUniforms, &line_draw_params).unwrap();
+                        let matrix: [[f32; 4]; 4] = (perspective_matrix * view_matrix).into();
+
+                        let uniforms = glium::uniform! {
+                            matrix: matrix
+                        };
+
+                        frame.draw(&particles_vertex_buffer, &particle_indices, &particle_program, &uniforms, &particle_draw_params).unwrap();
+
+                        frame.draw(&cubicle_buffer, &cubicle_indices, &line_program, &uniforms, &line_draw_params).unwrap();
+
+                        frame.draw(&shower_buffer, &shower_indices, &line_program, &uniforms, &line_draw_params).unwrap();
 
                         frame.finish().unwrap();
                         }
@@ -300,16 +327,11 @@ fn run_benchmarks(){
 
     let mut ps = ParticleSystem::new();
 
-    let speed = 2.0;
     for _ in 0..NUM_PARTICLES {
-        let (x, y) = random_emitter_position();
+        let (x, y, z) = random_emitter_position();
+        let (vx, vy, vz) = random_cone_velocity();
 
-        let angle_deg: f32 = rand::random_range(-30.0..=30.0);
-        let angle_rad = angle_deg.to_radians();
-
-        let vx = speed * angle_rad.sin();
-        let vy = speed * angle_rad.cos();
-        ps.particles.push(Particle::new(x, y, vx, vy));
+        ps.particles.push(Particle::new(x, y, z, vx, vy, vz));
     }
 
     let ps_sequential = ps.clone();
@@ -359,21 +381,24 @@ pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cell
 
                     for dx in -1..=1 {
                         for dy in -1..=1 {
-                            let neighbor_cell = (current_cell.0 + dx, current_cell.1 + dy);
+                            for dz in -1..=1 {
+                                let neighbor_cell = (current_cell.0 + dx, current_cell.1 + dy, current_cell.2 + dz);
 
-                            if let Some(neighbor_indices) = grid.get(&neighbor_cell) {
-                                for &j in neighbor_indices {
-                                    if j == i || merged[j] {
-                                        continue;
-                                    }
+                                if let Some(neighbor_indices) = grid.get(&neighbor_cell) {
+                                    for &j in neighbor_indices {
+                                        if j == i || merged[j] {
+                                            continue;
+                                        }
 
-                                    let dx = current.x - particles[j].x;
-                                    let dy = current.y - particles[j].y;
+                                        let dx = current.x - particles[j].x;
+                                        let dy = current.y - particles[j].y;
+                                        let dz = current.z - particles[j].z;
 
-                                    if dx * dx + dy * dy <= collision_radius * collision_radius {
-                                        current = ParticleSystem::merge(&current, &particles[j]);
-                                        merged[j] = true;
-                                        changed = true;
+                                        if dx * dx + dy * dy + dz * dz <= collision_radius * collision_radius {
+                                            current = ParticleSystem::merge(&current, &particles[j]);
+                                            merged[j] = true;
+                                            changed = true;
+                                        }
                                     }
                                 }
                             }
