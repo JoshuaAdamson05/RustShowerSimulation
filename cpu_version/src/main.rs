@@ -11,14 +11,14 @@ const HEIGHT: f32 = 2.0;
 const EMITTER_RADIUS: f32 = 0.05;
 
 fn main() {
-    const DEBUG_LOGGING: bool = true;
+    const DEBUG_LOGGING: bool = false;
     const NUM_PARTICLES: usize = 100_000;
     const NUM_STEPS: usize = 100_000;
     const NUM_RUNS: usize = 3;
-    const NUM_THREADS: usize = 2;
+    const NUM_THREADS: usize = 3;
     const GRAVITY: f32 = -9.81;
     const DELTA_TIME: f32 = 1.0 / 60.0;
-    const COLLISION_RADIUS: f32 = 0.00001;
+    const COLLISION_RADIUS: f32 = 0.0001;
 
     let mut ps = ParticleSystem::new();
 
@@ -131,13 +131,13 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
             let old_count = ps_clone.particles.len();
 
             let grid = ps_clone.build_grid(collision_radius * 2.0);
-            let collision_results = Arc::new(Mutex::new(Vec::<Vec<Particle>>::new()));
+            let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); num_threads];
             
             let len = ps_clone.particles.len();
             let collision_chunk_size = (len / num_threads).max(1);
 
             pool.scoped(|scope| {
-                for t in 0..num_threads {
+                for (t, output) in collision_outputs.iter_mut().enumerate() {
                     let start = t * collision_chunk_size;
                     let end = ((t + 1) * collision_chunk_size).min(len);
 
@@ -147,19 +147,19 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, num_threads: usize,
 
                     let particles = &ps_clone.particles;
                     let grid = &grid;
-                    let results = Arc::clone(&collision_results);
 
                     scope.execute(move || {
                         let local = resolve_collisions_chunk(particles, grid, collision_radius, start, end);
-                        results.lock().unwrap().push(local);
+
+                    *output = local;
                     });
                 }
             });
 
-            let mut new_particles = Vec::new();
+            let mut new_particles = Vec::with_capacity(len);
 
-            for chunk in collision_results.lock().unwrap().iter() {
-                new_particles.extend(chunk.iter().copied());
+            for output in collision_outputs {
+                new_particles.extend(output);
             }
 
             ps_clone.particles = new_particles;
