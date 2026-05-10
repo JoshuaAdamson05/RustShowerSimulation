@@ -4,6 +4,7 @@ use rand::{random_range};
 pub type Cell = (i32, i32, i32);
 pub type Grid = HashMap<Cell, Vec<usize>>;
 
+pub const CELL_SIZE: f32 = 0.02;
 pub const WIDTH: f32 = 1.0;
 pub const HEIGHT: f32 = 2.0;
 pub const DEPTH: f32 = 1.0;
@@ -168,7 +169,7 @@ impl ParticleSystem {
     pub fn resolve_collisions(&mut self, collision_radius: f32) {
         let old_count = self.particles.len();
 
-        let grid = self.build_grid(collision_radius * 2.0);
+        let grid = self.build_grid(CELL_SIZE);
         let mut merged = vec![false; self.particles.len()];
         let mut new_particles: Vec<Particle> = Vec::new();
 
@@ -183,7 +184,7 @@ impl ParticleSystem {
             while changed {
                 changed = false;    
 
-                let cell = get_cell(&current, collision_radius * 2.0);
+                let cell = get_cell(&current, CELL_SIZE);
 
                 for dx in -1..=1 {
                     for dy in -1..=1 {

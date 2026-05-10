@@ -17,7 +17,7 @@ fn main() {
 }
 
 fn run_visualisation() {
-    const NUM_PARTICLES: usize = 200_000;
+    const NUM_PARTICLES: usize = 100_000;
     const PHYSICS_THREADS: usize = 2;
     const COLLISION_THREADS: usize = 2;
     const TEMPERATURE_THREADS: usize = 2;
@@ -246,7 +246,7 @@ pub fn threaded_simulation_step(
 
     let old_count = ps.particles.len();
 
-    let grid = ps.build_grid(collision_radius * 2.0);
+    let grid = ps.build_grid(CELL_SIZE);
     let len = ps.particles.len();
 
     let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
@@ -382,7 +382,7 @@ pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cell
 
                 while changed {
                     changed = false;
-                    let current_cell = get_cell(&current, collision_radius * 2.0);
+                    let current_cell = get_cell(&current, CELL_SIZE);
 
                     for dx in -1..=1 {
                         for dy in -1..=1 {
@@ -449,7 +449,7 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, physics_threads: us
 
             let old_count = ps_clone.particles.len();
 
-            let grid = ps_clone.build_grid(collision_radius * 2.0);
+            let grid = ps_clone.build_grid(CELL_SIZE);
             let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); physics_threads];
             
             let len = ps_clone.particles.len();
