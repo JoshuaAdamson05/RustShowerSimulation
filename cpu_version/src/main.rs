@@ -1,10 +1,14 @@
-use std::{time::Instant};
+use std::{time::Instant, sync::Mutex, sync::atomic::{AtomicU8, Ordering}};
 use cgmath::{perspective, Matrix4, Point3, Rad, Vector3};
 use glium::{Surface, backend::glutin::SimpleWindowBuilder};
 mod simulation;
 mod renderer;
 use simulation::*;
 use renderer::*;
+
+const INACTIVE: u8 = 0;
+const ACTIVE: u8 = 1;
+const LOCKED: u8 = 2;
 
 fn main() {
     const VISUAL_MODE: bool = true;
@@ -19,7 +23,7 @@ fn main() {
 fn run_visualisation() {
     const NUM_PARTICLES: usize = 100_000;
     const PHYSICS_THREADS: usize = 2;
-    const COLLISION_THREADS: usize = 2;
+    const COLLISION_THREADS: usize = 4;
     const TEMPERATURE_THREADS: usize = 2;
 
     const DELTA_TIME: f32 = 1.0 / 60.0;
@@ -135,7 +139,7 @@ fn run_visualisation() {
                         }
 
                         glium::winit::event::WindowEvent::RedrawRequested => {
-                            threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR, frame_step);
+                            threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR);
 
                             if frame_step % 300 == 0 {
                                 println!("Floor Hits: {} | Particles {} | Avg Temp: {:.3}",
@@ -224,7 +228,6 @@ pub fn threaded_simulation_step(
     gravity: f32,
     collision_radius: f32,
     cooling_factor: f32,
-    step: usize,
 ) {
     let chunk_size = (ps.particles.len() / physics_threads).max(1);
     let mut floor_outputs = vec![0usize; physics_threads];
@@ -244,67 +247,12 @@ pub fn threaded_simulation_step(
     let total_hits: usize = floor_outputs.iter().sum();
     ps.stats.floor_hits += total_hits;
 
-    let old_count = ps.particles.len();
-
-    let grid = ps.build_grid(CELL_SIZE);
-    let len = ps.particles.len();
-
-    let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
-
-    for &cell in grid.keys() {
-        let owner = cell_owner(cell, collision_threads);
-        owned_cells[owner].push(cell);
-    }
-
-    let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); collision_threads];
-
-    collision_pool.scoped(|scope| {
-        for (t, output) in collision_outputs.iter_mut().enumerate() {
-            let cells = &owned_cells[t];
-
-            if cells.is_empty() {
-                continue;
-            }
-
-            let particles = &ps.particles;
-            let grid = &grid;
-
-            scope.execute(move || {
-                let local = resolve_owned_grid_cells(
-                    particles,
-                    grid,
-                    cells,
-                    collision_radius,
-                );
-
-                *output = local;
-            });
-        }
-    });
-
-    let mut new_particles = Vec::with_capacity(len);
-
-    for output in collision_outputs {
-        new_particles.extend(output);
-    }
-
-    ps.particles = new_particles;
-
-    let local_merges = old_count - ps.particles.len();
-    ps.stats.collision_count += local_merges;
-    ps.stats.merge_count += local_merges;
-
-    if step % 100 == 0 {
-        loop {
-            let before = ps.particles.len();
-            ps.resolve_collisions(collision_radius);
-            let after = ps.particles.len();
-
-            if before == after {
-                break;
-            }
-        }
-    }
+    resolve_collisions_threaded_atomic(
+        ps,
+        collision_pool,
+        collision_threads,
+        collision_radius,
+    );
 
     let temp_chunk_size = (ps.particles.len() / temperature_threads).max(1);
 
@@ -366,43 +314,154 @@ pub fn update_temperature_chunk(particles : &mut [Particle], delta_time : f32, c
     }
 }
 
-pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cells: &[Cell], collision_radius: f32) -> Vec<Particle> {
-    let mut merged = vec![false; particles.len()];
-    let mut local_particles = Vec::new();
+pub fn resolve_collisions_threaded_atomic(
+    ps: &mut ParticleSystem,
+    collision_pool: &mut scoped_threadpool::Pool,
+    collision_threads: usize,
+    collision_radius: f32,
+) {
+    let old_count = ps.particles.len();
+    let len = ps.particles.len();
 
+    let grid = ps.build_grid(CELL_SIZE);
+
+    let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
+
+    for &cell in grid.keys() {
+        let owner = cell_owner(cell, collision_threads);
+        owned_cells[owner].push(cell);
+    }
+
+    let states: Vec<AtomicU8> = (0..len)
+        .map(|_| AtomicU8::new(ACTIVE))
+        .collect();
+
+    let output_slots: Vec<Mutex<Option<Particle>>> = (0..len)
+        .map(|_| Mutex::new(None))
+        .collect();
+
+    collision_pool.scoped(|scope| {
+        for t in 0..collision_threads {
+            let cells = &owned_cells[t];
+
+            if cells.is_empty() {
+                continue;
+            }
+
+            let particles = &ps.particles;
+            let grid = &grid;
+            let states = &states;
+            let output_slots = &output_slots;
+
+            scope.execute(move || {
+                resolve_owned_grid_cells_atomic(
+                    particles,
+                    grid,
+                    cells,
+                    collision_radius,
+                    states,
+                    output_slots,
+                );
+            });
+        }
+    });
+
+    let mut new_particles = Vec::with_capacity(len);
+
+    for i in 0..len {
+        let state = states[i].load(Ordering::Acquire);
+
+        if state != INACTIVE {
+            let particle = output_slots[i]
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(ps.particles[i]);
+
+            new_particles.push(particle);
+        }
+    }
+
+    ps.particles = new_particles;
+
+    let merges = old_count - ps.particles.len();
+
+    ps.stats.collision_count += merges;
+    ps.stats.merge_count += merges;
+}
+
+pub fn resolve_owned_grid_cells_atomic(
+    particles: &[Particle],
+    grid: &Grid,
+    owned_cells: &[Cell],
+    collision_radius: f32,
+    states: &[AtomicU8],
+    output_slots: &[Mutex<Option<Particle>>],
+) {
     for &cell in owned_cells {
         if let Some(indices) = grid.get(&cell) {
             for &i in indices {
-                if merged[i] {
+                // Try to claim this particle as the active survivor.
+                // If another thread has already merged it, skip it.
+                if states[i]
+                    .compare_exchange(ACTIVE, LOCKED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     continue;
                 }
 
                 let mut current = particles[i];
-                let mut changed = true;
+                let current_cell = get_cell(&current, CELL_SIZE);
+                let mut has_merged = false;
 
-                while changed {
-                    changed = false;
-                    let current_cell = get_cell(&current, CELL_SIZE);
+                for dx in -1..=1 {
+                    if has_merged {
+                        break;
+                    }
 
-                    for dx in -1..=1 {
-                        for dy in -1..=1 {
-                            for dz in -1..=1 {
-                                let neighbor_cell = (current_cell.0 + dx, current_cell.1 + dy, current_cell.2 + dz);
+                    for dy in -1..=1 {
+                        if has_merged {
+                            break;
+                        }
 
-                                if let Some(neighbor_indices) = grid.get(&neighbor_cell) {
-                                    for &j in neighbor_indices {
-                                        if j == i || merged[j] {
-                                            continue;
-                                        }
+                        for dz in -1..=1 {
+                            if has_merged {
+                                break;
+                            }
 
-                                        let dx = current.x - particles[j].x;
-                                        let dy = current.y - particles[j].y;
-                                        let dz = current.z - particles[j].z;
+                            let neighbour_cell = (
+                                current_cell.0 + dx,
+                                current_cell.1 + dy,
+                                current_cell.2 + dz,
+                            );
 
-                                        if dx * dx + dy * dy + dz * dz <= collision_radius * collision_radius {
+                            if let Some(neighbour_indices) = grid.get(&neighbour_cell) {
+                                for &j in neighbour_indices {
+                                    if j == i {
+                                        continue;
+                                    }
+
+                                    let dx = current.x - particles[j].x;
+                                    let dy = current.y - particles[j].y;
+                                    let dz = current.z - particles[j].z;
+
+                                    let distance_sq = dx * dx + dy * dy + dz * dz;
+                                    let collision_sq = collision_radius * collision_radius;
+
+                                    if distance_sq <= collision_sq {
+                                        // Try to claim particle j.
+                                        if states[j]
+                                            .compare_exchange(
+                                                ACTIVE,
+                                                INACTIVE,
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                            )
+                                            .is_ok()
+                                        {
                                             current = ParticleSystem::merge(&current, &particles[j]);
-                                            merged[j] = true;
-                                            changed = true;
+                                            has_merged = true;
+                                            break;
                                         }
                                     }
                                 }
@@ -411,102 +470,74 @@ pub fn resolve_owned_grid_cells(particles : &[Particle], grid: &Grid, owned_cell
                     }
                 }
 
-                local_particles.push(current);
+                // Store this particle's resulting state.
+                *output_slots[i].lock().unwrap() = Some(current);
+
+                // Unlock the survivor.
+                states[i].store(ACTIVE, Ordering::Release);
             }
         }
     }
-
-    local_particles
 }
 
-fn run_threaded_simulation(ps: ParticleSystem, steps: usize, physics_threads: usize, collision_threads: usize, temperature_threads: usize, runs: usize, delta_time : f32, gravity : f32, collision_radius: f32, cooling_factor : f32, debug_logging : bool)
-{
+fn run_threaded_simulation(
+    ps: ParticleSystem,
+    steps: usize,
+    physics_threads: usize,
+    collision_threads: usize,
+    temperature_threads: usize,
+    runs: usize,
+    delta_time: f32,
+    gravity: f32,
+    collision_radius: f32,
+    cooling_factor: f32,
+    debug_logging: bool,
+) {
     let mut total = 0.0;
 
     for _ in 0..runs {
-        let mut ps_clone = ps.clone();      
+        let mut ps_clone = ps.clone();
+
         let mut physics_pool = scoped_threadpool::Pool::new(physics_threads as u32);
         let mut collision_pool = scoped_threadpool::Pool::new(collision_threads as u32);
-        let mut temeperature_pool = scoped_threadpool::Pool::new(temperature_threads as u32);
+        let mut temperature_pool = scoped_threadpool::Pool::new(temperature_threads as u32);
 
         let start = Instant::now();
 
         for step in 0..steps {
-            let chunk_size: usize = (ps_clone.particles.len() / physics_threads).max(1);   
-            let mut floor_outputs = vec![0usize; physics_threads];
+            // Physics stage
+            let chunk_size = (ps_clone.particles.len() / physics_threads).max(1);
+            let chunk_count = (ps_clone.particles.len() + chunk_size - 1) / chunk_size;
+
+            let mut floor_outputs = vec![0usize; chunk_count];
 
             physics_pool.scoped(|scope| {
-                for (slice, output) in ps_clone.particles.chunks_mut(chunk_size).zip(floor_outputs.iter_mut()) {
+                for (slice, output) in ps_clone
+                    .particles
+                    .chunks_mut(chunk_size)
+                    .zip(floor_outputs.iter_mut())
+                {
                     scope.execute(move || {
                         *output = update_particle_chunk(slice, delta_time, gravity);
                     });
                 }
             });
 
-            //Combine results
             let total_hits: usize = floor_outputs.iter().sum();
             ps_clone.stats.floor_hits += total_hits;
 
-            let old_count = ps_clone.particles.len();
+            // Collision / merging stage
+            resolve_collisions_threaded_atomic(
+                &mut ps_clone,
+                &mut collision_pool,
+                collision_threads,
+                collision_radius,
+            );
 
-            let grid = ps_clone.build_grid(CELL_SIZE);
-            let mut collision_outputs: Vec<Vec<Particle>> = vec![Vec::new(); physics_threads];
-            
-            let len = ps_clone.particles.len();
-            let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
+            // Temperature stage
+            let temp_chunk_size = (ps_clone.particles.len() / temperature_threads).max(1);
 
-            for &cell in grid.keys() {
-                let owner = cell_owner(cell, collision_threads);
-                owned_cells[owner].push(cell);
-            }
-
-            collision_pool.scoped(|scope| {
-                for (t, output) in collision_outputs.iter_mut().enumerate() {
-                    let cells = &owned_cells[t];
-
-                    if cells.is_empty() {
-                        continue;
-                    }
-
-                    let particles = &ps_clone.particles;
-                    let grid = &grid;
-
-                    scope.execute(move || {
-                    let local = resolve_owned_grid_cells(particles, grid, cells, collision_radius);
-
-                    *output = local;
-                    });
-                }
-            });
-
-            let mut new_particles = Vec::with_capacity(len);
-
-            for output in collision_outputs {
-                new_particles.extend(output);
-            }
-
-            ps_clone.particles = new_particles;
-
-            let local_merges = old_count - ps_clone.particles.len();
-            ps_clone.stats.collision_count += local_merges;
-            ps_clone.stats.merge_count += local_merges;
-
-            // Cross-thread merge
-            if step % 100 == 0 {
-                loop {
-                    let before = ps_clone.particles.len();
-                    ps_clone.resolve_collisions(collision_radius);
-                    let after = ps_clone.particles.len();
-
-                    if before == after {
-                        break;
-                    }
-                }
-            }
-
-            let temp_chunk_size = (ps_clone.particles.len() / physics_threads).max(1);
-
-            temeperature_pool.scoped(|scope| {
+            temperature_pool.scoped(|scope| {
                 for slice in ps_clone.particles.chunks_mut(temp_chunk_size) {
                     scope.execute(move || {
                         update_temperature_chunk(slice, delta_time, cooling_factor);
@@ -517,8 +548,13 @@ fn run_threaded_simulation(ps: ParticleSystem, steps: usize, physics_threads: us
             if debug_logging && step % 20_000 == 0 {
                 println!(
                     "Threaded Step: {}, Particles: {}, Floor Hits: {}, Collisions: {}, Merges: {}, Avg Temp: {:.3}, Min Temp: {:.3}",
-                    step, ps_clone.particles.len(), ps_clone.stats.floor_hits, ps_clone.stats.collision_count,
-                    ps_clone.stats.merge_count, ps_clone.average_temperature(), ps_clone.min_temperature()
+                    step,
+                    ps_clone.particles.len(),
+                    ps_clone.stats.floor_hits,
+                    ps_clone.stats.collision_count,
+                    ps_clone.stats.merge_count,
+                    ps_clone.average_temperature(),
+                    ps_clone.min_temperature()
                 );
             }
         }

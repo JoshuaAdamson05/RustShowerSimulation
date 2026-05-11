@@ -171,7 +171,7 @@ impl ParticleSystem {
 
         let grid = self.build_grid(CELL_SIZE);
         let mut merged = vec![false; self.particles.len()];
-        let mut new_particles: Vec<Particle> = Vec::new();
+        let mut new_particles: Vec<Particle> = Vec::with_capacity(self.particles.len());
 
         for i in 0..self.particles.len() {
             if merged[i] {
@@ -179,38 +179,45 @@ impl ParticleSystem {
             }
 
             let mut current = self.particles[i];
-            let mut changed = true;
+            let cell = get_cell(&current, CELL_SIZE);
+            let mut has_merged = false;
 
-            while changed {
-                changed = false;    
+            for dx in -1..=1 {
+                if has_merged {
+                    break;
+                }
 
-                let cell = get_cell(&current, CELL_SIZE);
+                for dy in -1..=1 {
+                    if has_merged {
+                        break;
+                    }
 
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        for dz in -1..=1 {
-                            let neighbour_cell = (cell.0 + dx, cell.1 + dy, cell.2 + dz);
+                    for dz in -1..=1 {
+                        if has_merged {
+                            break;
+                        }
 
-                            if let Some(indices) = grid.get(&neighbour_cell) {
-                                for &j in indices {
-                                    if j == i || merged[j] {
-                                        continue;
-                                    }
+                        let neighbour_cell = (cell.0 + dx, cell.1 + dy, cell.2 + dz);
 
-                                    if Self::are_colliding(&current, &self.particles[j], collision_radius)
-                                    {
-                                        current = Self::merge(&current, &self.particles[j]);
-                                        merged[j] = true;
-                                        changed = true;
-                                    }
+                        if let Some(indices) = grid.get(&neighbour_cell) {
+                            for &j in indices {
+                                if j == i || merged[j] {
+                                    continue;
+                                }
+
+                                if Self::are_colliding(&current, &self.particles[j], collision_radius)
+                                {
+                                    current = Self::merge(&current, &self.particles[j]);
+                                    merged[j] = true;
+                                    has_merged = true;
+                                    break;
                                 }
                             }
                         }
-
                     }
                 }
             }
-
+            
             new_particles.push(current);
         }
         self.particles = new_particles;
