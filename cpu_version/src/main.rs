@@ -24,7 +24,7 @@ fn main() {
 fn run_visualisation() {
     const NUM_PARTICLES: usize = 100_000;
     const PHYSICS_THREADS: usize = 2;
-    const COLLISION_THREADS: usize = 6;
+    const COLLISION_THREADS: usize = 2;
     const TEMPERATURE_THREADS: usize = 2;
 
     const DELTA_TIME: f32 = 1.0 / 60.0;
@@ -153,8 +153,8 @@ fn run_visualisation() {
                             if frame_step % 300 == 0 {
                                 let avg_update_ms = total_update_ms / frame_step as f64;
 
-                                println!("Floor Hits: {} | Particles {} | Avg Temp: {:.3} | Rust Update: {:.3} ms | Avg Rust Update: {:.3} ms",
-                                ps.stats.floor_hits, ps.particles.len(), ps.average_temperature(), update_ms, avg_update_ms)
+                                println!("Frame: {} | Floor Hits: {} | Particles {} | Avg Temp: {:.3} | Rust Update: {:.3} ms | Avg Rust Update: {:.3} ms",
+                                frame_step, ps.stats.floor_hits, ps.particles.len(), ps.average_temperature(), update_ms, avg_update_ms)
                             }
 
                             // Particles
