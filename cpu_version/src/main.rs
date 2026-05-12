@@ -9,6 +9,7 @@ use renderer::*;
 const INACTIVE: u8 = 0;
 const ACTIVE: u8 = 1;
 const LOCKED: u8 = 2;
+const SURVIVOR: u8 = 3;
 
 fn main() {
     const VISUAL_MODE: bool = true;
@@ -23,7 +24,7 @@ fn main() {
 fn run_visualisation() {
     const NUM_PARTICLES: usize = 100_000;
     const PHYSICS_THREADS: usize = 2;
-    const COLLISION_THREADS: usize = 4;
+    const COLLISION_THREADS: usize = 6;
     const TEMPERATURE_THREADS: usize = 2;
 
     const DELTA_TIME: f32 = 1.0 / 60.0;
@@ -174,12 +175,12 @@ fn run_visualisation() {
                         frame.clear_color_and_depth((0.02, 0.02, 0.02, 1.0), 1.0);
 
                         let particle_draw_params = glium::DrawParameters {
-                            point_size: Some(14.0),
+                            point_size: Some(8.0),
                             ..Default::default()
                         };
 
                         let line_draw_params = glium::DrawParameters {
-                            line_width: Some(4.0),
+                            line_width: Some(2.0),
                             ..Default::default()
                         };
 
@@ -441,6 +442,10 @@ pub fn resolve_owned_grid_cells_atomic(
                                         continue;
                                     }
 
+                                    if states[j].load(Ordering::Acquire) != ACTIVE {
+                                        continue;
+                                    }
+
                                     let dx = current.x - particles[j].x;
                                     let dy = current.y - particles[j].y;
                                     let dz = current.z - particles[j].z;
@@ -474,7 +479,7 @@ pub fn resolve_owned_grid_cells_atomic(
                 *output_slots[i].lock().unwrap() = Some(current);
 
                 // Unlock the survivor.
-                states[i].store(ACTIVE, Ordering::Release);
+                states[i].store(SURVIVOR, Ordering::Release);
             }
         }
     }
