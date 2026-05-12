@@ -112,6 +112,7 @@ fn run_visualisation() {
 
     let mut render_mode = RenderMode::Thermal;
     let mut frame_step: usize = 0;
+    let mut total_update_ms = 0.0f64;
 
     #[allow(deprecated)]
     event_loop
@@ -140,14 +141,21 @@ fn run_visualisation() {
                         }
 
                         glium::winit::event::WindowEvent::RedrawRequested => {
+                            let update_start = std::time::Instant::now();
+
                             threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR);
 
-                            if frame_step % 300 == 0 {
-                                println!("Floor Hits: {} | Particles {} | Avg Temp: {:.3}",
-                                ps.stats.floor_hits, ps.particles.len(), ps.average_temperature())
-                            }
-
+                            let update_duration = update_start.elapsed();
+                            let update_ms = update_duration.as_secs_f64() * 1000.0;
+                            total_update_ms += update_ms;
                             frame_step += 1;
+
+                            if frame_step % 300 == 0 {
+                                let avg_update_ms = total_update_ms / frame_step as f64;
+
+                                println!("Floor Hits: {} | Particles {} | Avg Temp: {:.3} | Rust Update: {:.3} ms | Avg Rust Update: {:.3} ms",
+                                ps.stats.floor_hits, ps.particles.len(), ps.average_temperature(), update_ms, avg_update_ms)
+                            }
 
                             // Particles
                             let particle_vertices = particles_to_vertices(&ps.particles, &render_mode, RENDER_STRIDE);
