@@ -1,4 +1,4 @@
-use std::{time::Instant, sync::Mutex, sync::atomic::{AtomicU8, Ordering}};
+use std::{collections::HashMap, time::Instant, sync::Mutex, sync::atomic::{AtomicU8, Ordering}};
 use cgmath::{perspective, Matrix4, Point3, Rad, Vector3};
 use glium::{Surface, backend::glutin::SimpleWindowBuilder};
 mod simulation;
@@ -11,13 +11,70 @@ const ACTIVE: u8 = 1;
 const LOCKED: u8 = 2;
 const SURVIVOR: u8 = 3;
 
+struct ReusableGrid {
+    cell_to_bucket: HashMap<Cell, usize>,
+    buckets: Vec<Vec<usize>>,
+    occupied_cells: Vec<Cell>,
+}
+
+impl ReusableGrid {
+    fn new(capacity: usize) -> Self {
+        Self {
+            cell_to_bucket: HashMap::with_capacity(capacity),
+            buckets: Vec::new(),
+            occupied_cells: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn rebuild(&mut self, particles: &[Particle]) {
+        self.cell_to_bucket.clear();
+        self.occupied_cells.clear();
+
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+
+        let mut used_buckets = 0usize;
+
+        for (index, particle) in particles.iter().enumerate() {
+            let cell = get_cell(particle, CELL_SIZE);
+
+            let bucket_index = if let Some(&bucket_index) = self.cell_to_bucket.get(&cell) {
+                bucket_index
+            } else {
+                let bucket_index = used_buckets;
+                used_buckets += 1;
+
+                if bucket_index == self.buckets.len() {
+                    self.buckets.push(Vec::new());
+                }
+
+                self.cell_to_bucket.insert(cell, bucket_index);
+                self.occupied_cells.push(cell);
+                bucket_index
+            };
+
+            self.buckets[bucket_index].push(index);
+        }
+    }
+
+    fn get(&self, cell: &Cell) -> Option<&Vec<usize>> {
+        self.cell_to_bucket
+            .get(cell)
+            .map(|&bucket_index| &self.buckets[bucket_index])
+    }
+}
+
 pub struct CollisionScratch {
     states: Vec<AtomicU8>,
     output_slots: Vec<Mutex<Option<Particle>>>,
+    grid: ReusableGrid,
+    owned_cells: Vec<Vec<Cell>>,
+    compacted_particles: Vec<Particle>,
 }
 
 impl CollisionScratch {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, collision_threads: usize) -> Self {
         let states = (0..capacity)
             .map(|_| AtomicU8::new(ACTIVE))
             .collect();
@@ -29,10 +86,13 @@ impl CollisionScratch {
         Self {
             states,
             output_slots,
+            grid: ReusableGrid::new(capacity),
+            owned_cells: (0..collision_threads).map(|_| Vec::new()).collect(),
+            compacted_particles: Vec::with_capacity(capacity),
         }
     }
 
-    fn prepare(&mut self, len: usize) {
+    fn prepare(&mut self, len: usize, collision_threads: usize) {
         while self.states.len() < len {
             self.states.push(AtomicU8::new(ACTIVE));
             self.output_slots.push(Mutex::new(None));
@@ -40,6 +100,14 @@ impl CollisionScratch {
 
         for state in self.states.iter().take(len) {
             state.store(ACTIVE, Ordering::Relaxed);
+        }
+
+        while self.owned_cells.len() < collision_threads {
+            self.owned_cells.push(Vec::new());
+        }
+
+        for cells in self.owned_cells.iter_mut().take(collision_threads) {
+            cells.clear();
         }
     }
 }
@@ -219,15 +287,11 @@ fn run_visualisation() {
     let mut physics_pool = scoped_threadpool::Pool::new(PHYSICS_THREADS as u32);
     let mut collision_pool = scoped_threadpool::Pool::new(COLLISION_THREADS as u32);
     let mut temperature_pool = scoped_threadpool::Pool::new(TEMPERATURE_THREADS as u32);
-    let mut collision_scratch = CollisionScratch::new(NUM_PARTICLES);
+    let mut collision_scratch = CollisionScratch::new(NUM_PARTICLES, COLLISION_THREADS);
 
-    // Static geometry never changes, so upload it once rather than rebuilding and
-    // reallocating its GPU buffers every frame.
     let cubicle_buffer = glium::VertexBuffer::new(&display, &cubicle_vertices()).unwrap();
     let shower_buffer = glium::VertexBuffer::new(&display, &shower_head_vertices()).unwrap();
 
-    // Particle data changes each frame, but the maximum displayed vertex count is
-    // fixed by the render stride. Reuse one dynamic GPU buffer and update a slice.
     let particles_vertex_buffer =
         glium::VertexBuffer::<Vertex>::empty_dynamic(&display, MAX_RENDER_VERTICES).unwrap();
 
@@ -529,53 +593,55 @@ pub fn resolve_collisions_threaded_atomic(
     let old_count = ps.particles.len();
     let len = ps.particles.len();
 
+    collision_scratch.prepare(len, collision_threads);
+
     let grid_start = Instant::now();
-    let grid = ps.build_grid(CELL_SIZE);
+    collision_scratch.grid.rebuild(&ps.particles);
     let grid_build_ms = grid_start.elapsed().as_secs_f64() * 1000.0;
 
     let collision_start = Instant::now();
-    let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
 
-    for &cell in grid.keys() {
+    for &cell in &collision_scratch.grid.occupied_cells {
         let owner = cell_owner(cell, collision_threads);
-        owned_cells[owner].push(cell);
+        collision_scratch.owned_cells[owner].push(cell);
     }
 
-    collision_scratch.prepare(len);
-    let states = &collision_scratch.states[..len];
-    let output_slots = &collision_scratch.output_slots[..len];
+    {
+        let grid = &collision_scratch.grid;
+        let owned_cells = &collision_scratch.owned_cells;
+        let states = &collision_scratch.states[..len];
+        let output_slots = &collision_scratch.output_slots[..len];
 
-    collision_pool.scoped(|scope| {
-        for t in 0..collision_threads {
-            let cells = &owned_cells[t];
+        collision_pool.scoped(|scope| {
+            for cells in owned_cells.iter().take(collision_threads) {
+                if cells.is_empty() {
+                    continue;
+                }
 
-            if cells.is_empty() {
-                continue;
+                let particles = &ps.particles;
+
+                scope.execute(move || {
+                    resolve_owned_grid_cells_atomic(
+                        particles,
+                        grid,
+                        cells,
+                        collision_radius,
+                        states,
+                        output_slots,
+                    );
+                });
             }
+        });
+    }
 
-            let particles = &ps.particles;
-            let grid = &grid;
-
-            scope.execute(move || {
-                resolve_owned_grid_cells_atomic(
-                    particles,
-                    grid,
-                    cells,
-                    collision_radius,
-                    states,
-                    output_slots,
-                );
-            });
-        }
-    });
-
-    let mut new_particles = Vec::with_capacity(len);
+    let mut new_particles = std::mem::take(&mut collision_scratch.compacted_particles);
+    new_particles.clear();
 
     for i in 0..len {
-        let state = states[i].load(Ordering::Acquire);
+        let state = collision_scratch.states[i].load(Ordering::Acquire);
 
         if state != INACTIVE {
-            let particle = output_slots[i]
+            let particle = collision_scratch.output_slots[i]
                 .lock()
                 .unwrap()
                 .take()
@@ -585,9 +651,11 @@ pub fn resolve_collisions_threaded_atomic(
         }
     }
 
-    ps.particles = new_particles;
+    let new_count = new_particles.len();
+    let old_particles = std::mem::replace(&mut ps.particles, new_particles);
+    collision_scratch.compacted_particles = old_particles;
 
-    let merges = old_count - ps.particles.len();
+    let merges = old_count - new_count;
     ps.stats.collision_count += merges;
     ps.stats.merge_count += merges;
 
@@ -599,7 +667,7 @@ pub fn resolve_collisions_threaded_atomic(
 
 pub fn resolve_owned_grid_cells_atomic(
     particles: &[Particle],
-    grid: &Grid,
+    grid: &ReusableGrid,
     owned_cells: &[Cell],
     collision_radius: f32,
     states: &[AtomicU8],
@@ -703,7 +771,7 @@ fn run_threaded_simulation(
         let mut physics_pool = scoped_threadpool::Pool::new(physics_threads as u32);
         let mut collision_pool = scoped_threadpool::Pool::new(collision_threads as u32);
         let mut temperature_pool = scoped_threadpool::Pool::new(temperature_threads as u32);
-        let mut collision_scratch = CollisionScratch::new(ps_clone.particles.len());
+        let mut collision_scratch = CollisionScratch::new(ps_clone.particles.len(), collision_threads);
 
         let start = Instant::now();
 
