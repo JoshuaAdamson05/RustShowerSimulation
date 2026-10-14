@@ -4,7 +4,7 @@ use rand::{random_range};
 pub type Cell = (i32, i32, i32);
 pub type Grid = HashMap<Cell, Vec<usize>>;
 
-pub const CELL_SIZE: f32 = 0.02;
+pub const CELL_SIZE: f32 = 0.005;
 pub const WIDTH: f32 = 1.0;
 pub const HEIGHT: f32 = 2.0;
 pub const DEPTH: f32 = 1.0;
@@ -44,9 +44,7 @@ impl Particle
         }
 
         self.x += self.vx * delta_time;
-
         self.y += self.vy * delta_time;
-
         self.z += self.vz * delta_time;
 
         if self.x <= 0.0 {
@@ -125,7 +123,6 @@ impl ParticleSystem {
         }
 
         let total: f32 = self.particles.iter().map(|p| p.temperature).sum();
-
         total / self.particles.len() as f32
     }
 
@@ -179,25 +176,26 @@ impl ParticleSystem {
             }
 
             let mut current = self.particles[i];
-            let cell = get_cell(&current, CELL_SIZE);
+            let ((min_x, min_y, min_z), (max_x, max_y, max_z)) =
+                collision_cell_bounds(&current, collision_radius, CELL_SIZE);
             let mut has_merged = false;
 
-            for dx in -1..=1 {
+            for cell_x in min_x..=max_x {
                 if has_merged {
                     break;
                 }
 
-                for dy in -1..=1 {
+                for cell_y in min_y..=max_y {
                     if has_merged {
                         break;
                     }
 
-                    for dz in -1..=1 {
+                    for cell_z in min_z..=max_z {
                         if has_merged {
                             break;
                         }
 
-                        let neighbour_cell = (cell.0 + dx, cell.1 + dy, cell.2 + dz);
+                        let neighbour_cell = (cell_x, cell_y, cell_z);
 
                         if let Some(indices) = grid.get(&neighbour_cell) {
                             for &j in indices {
@@ -260,7 +258,6 @@ impl ParticleSystem {
     }
  }
 
-
 pub fn random_cone_velocity() -> (f32, f32, f32) {
     let speed: f32 = 2.0;
 
@@ -281,6 +278,18 @@ pub fn get_cell(p: &Particle, cell_size: f32) -> Cell {
     let y = (p.y / cell_size).floor() as i32;
     let z = (p.z / cell_size).floor() as i32;
     (x, y, z)
+}
+
+pub fn collision_cell_bounds(p: &Particle, radius: f32, cell_size: f32) -> (Cell, Cell) {
+    let min_x = ((p.x - radius) / cell_size).floor() as i32;
+    let min_y = ((p.y - radius) / cell_size).floor() as i32;
+    let min_z = ((p.z - radius) / cell_size).floor() as i32;
+
+    let max_x = ((p.x + radius) / cell_size).floor() as i32;
+    let max_y = ((p.y + radius) / cell_size).floor() as i32;
+    let max_z = ((p.z + radius) / cell_size).floor() as i32;
+
+    ((min_x, min_y, min_z), (max_x, max_y, max_z))
 }
 
 pub fn random_emitter_position() -> (f32, f32, f32) {
