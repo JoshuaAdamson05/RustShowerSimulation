@@ -11,6 +11,39 @@ const ACTIVE: u8 = 1;
 const LOCKED: u8 = 2;
 const SURVIVOR: u8 = 3;
 
+pub struct CollisionScratch {
+    states: Vec<AtomicU8>,
+    output_slots: Vec<Mutex<Option<Particle>>>,
+}
+
+impl CollisionScratch {
+    fn new(capacity: usize) -> Self {
+        let states = (0..capacity)
+            .map(|_| AtomicU8::new(ACTIVE))
+            .collect();
+
+        let output_slots = (0..capacity)
+            .map(|_| Mutex::new(None))
+            .collect();
+
+        Self {
+            states,
+            output_slots,
+        }
+    }
+
+    fn prepare(&mut self, len: usize) {
+        while self.states.len() < len {
+            self.states.push(AtomicU8::new(ACTIVE));
+            self.output_slots.push(Mutex::new(None));
+        }
+
+        for state in self.states.iter().take(len) {
+            state.store(ACTIVE, Ordering::Relaxed);
+        }
+    }
+}
+
 fn main() {
     const VISUAL_MODE: bool = true;
 
@@ -110,6 +143,8 @@ fn run_visualisation() {
     let mut temperature_pool =
         scoped_threadpool::Pool::new(TEMPERATURE_THREADS as u32);
 
+    let mut collision_scratch = CollisionScratch::new(NUM_PARTICLES);
+
     let mut render_mode = RenderMode::Thermal;
     let mut frame_step: usize = 0;
     let mut total_update_ms = 0.0f64;
@@ -143,7 +178,7 @@ fn run_visualisation() {
                         glium::winit::event::WindowEvent::RedrawRequested => {
                             let update_start = std::time::Instant::now();
 
-                            threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR);
+                            threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, &mut collision_scratch, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR);
 
                             let update_duration = update_start.elapsed();
                             let update_ms = update_duration.as_secs_f64() * 1000.0;
@@ -230,6 +265,7 @@ pub fn threaded_simulation_step(
     physics_pool: &mut scoped_threadpool::Pool,
     collision_pool: &mut scoped_threadpool::Pool,
     temperature_pool: &mut scoped_threadpool::Pool,
+    collision_scratch: &mut CollisionScratch,
     physics_threads: usize,
     collision_threads: usize,
     temperature_threads: usize,
@@ -261,6 +297,7 @@ pub fn threaded_simulation_step(
         collision_pool,
         collision_threads,
         collision_radius,
+        collision_scratch,
     );
 
     let temp_chunk_size = (ps.particles.len() / temperature_threads).max(1);
@@ -328,6 +365,7 @@ pub fn resolve_collisions_threaded_atomic(
     collision_pool: &mut scoped_threadpool::Pool,
     collision_threads: usize,
     collision_radius: f32,
+    collision_scratch: &mut CollisionScratch,
 ) {
     let old_count = ps.particles.len();
     let len = ps.particles.len();
@@ -341,13 +379,9 @@ pub fn resolve_collisions_threaded_atomic(
         owned_cells[owner].push(cell);
     }
 
-    let states: Vec<AtomicU8> = (0..len)
-        .map(|_| AtomicU8::new(ACTIVE))
-        .collect();
-
-    let output_slots: Vec<Mutex<Option<Particle>>> = (0..len)
-        .map(|_| Mutex::new(None))
-        .collect();
+    collision_scratch.prepare(len);
+    let states = &collision_scratch.states[..len];
+    let output_slots = &collision_scratch.output_slots[..len];
 
     collision_pool.scoped(|scope| {
         for t in 0..collision_threads {
@@ -359,8 +393,6 @@ pub fn resolve_collisions_threaded_atomic(
 
             let particles = &ps.particles;
             let grid = &grid;
-            let states = &states;
-            let output_slots = &output_slots;
 
             scope.execute(move || {
                 resolve_owned_grid_cells_atomic(
@@ -514,6 +546,7 @@ fn run_threaded_simulation(
         let mut physics_pool = scoped_threadpool::Pool::new(physics_threads as u32);
         let mut collision_pool = scoped_threadpool::Pool::new(collision_threads as u32);
         let mut temperature_pool = scoped_threadpool::Pool::new(temperature_threads as u32);
+        let mut collision_scratch = CollisionScratch::new(ps_clone.particles.len());
 
         let start = Instant::now();
 
@@ -545,6 +578,7 @@ fn run_threaded_simulation(
                 &mut collision_pool,
                 collision_threads,
                 collision_radius,
+                &mut collision_scratch,
             );
 
             // Temperature stage
