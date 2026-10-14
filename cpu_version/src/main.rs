@@ -134,15 +134,9 @@ fn run_visualisation() {
         ps.particles.push(Particle::new(x, y, z, vx, vy, vz));
     }
 
-    let mut physics_pool =
-        scoped_threadpool::Pool::new(PHYSICS_THREADS as u32);
-
-    let mut collision_pool =
-        scoped_threadpool::Pool::new(COLLISION_THREADS as u32);
-
-    let mut temperature_pool =
-        scoped_threadpool::Pool::new(TEMPERATURE_THREADS as u32);
-
+    let mut physics_pool = scoped_threadpool::Pool::new(PHYSICS_THREADS as u32);
+    let mut collision_pool = scoped_threadpool::Pool::new(COLLISION_THREADS as u32);
+    let mut temperature_pool = scoped_threadpool::Pool::new(TEMPERATURE_THREADS as u32);
     let mut collision_scratch = CollisionScratch::new(NUM_PARTICLES);
 
     let mut render_mode = RenderMode::Thermal;
@@ -164,12 +158,8 @@ fn run_visualisation() {
 
                             if event.state == glium::winit::event::ElementState::Pressed {
                                 match event.physical_key {
-                                    PhysicalKey::Code(KeyCode::KeyT) => {
-                                        render_mode = RenderMode::Thermal;
-                                    }
-                                    PhysicalKey::Code(KeyCode::KeyM) => {
-                                        render_mode = RenderMode::Mass;
-                                    }
+                                    PhysicalKey::Code(KeyCode::KeyT) => render_mode = RenderMode::Thermal,
+                                    PhysicalKey::Code(KeyCode::KeyM) => render_mode = RenderMode::Mass,
                                     _ => {}
                                 }
                             }
@@ -178,7 +168,20 @@ fn run_visualisation() {
                         glium::winit::event::WindowEvent::RedrawRequested => {
                             let update_start = std::time::Instant::now();
 
-                            threaded_simulation_step(&mut ps, &mut physics_pool, &mut collision_pool, &mut temperature_pool, &mut collision_scratch, PHYSICS_THREADS, COLLISION_THREADS, TEMPERATURE_THREADS, DELTA_TIME, GRAVITY, COLLISION_RADIUS, COOLING_FACTOR);
+                            threaded_simulation_step(
+                                &mut ps,
+                                &mut physics_pool,
+                                &mut collision_pool,
+                                &mut temperature_pool,
+                                &mut collision_scratch,
+                                PHYSICS_THREADS,
+                                COLLISION_THREADS,
+                                TEMPERATURE_THREADS,
+                                DELTA_TIME,
+                                GRAVITY,
+                                COLLISION_RADIUS,
+                                COOLING_FACTOR,
+                            );
 
                             let update_duration = update_start.elapsed();
                             let update_ms = update_duration.as_secs_f64() * 1000.0;
@@ -192,58 +195,41 @@ fn run_visualisation() {
                                 frame_step, ps.stats.floor_hits, ps.particles.len(), ps.average_temperature(), update_ms, avg_update_ms)
                             }
 
-                            // Particles
                             let particle_vertices = particles_to_vertices(&ps.particles, &render_mode, RENDER_STRIDE);
-
                             let particles_vertex_buffer = glium::VertexBuffer::new(&display, &particle_vertices).unwrap();
-
                             let particle_indices = glium::index::NoIndices(glium::index::PrimitiveType::Points);
 
-                            // Cubicle
                             let cubicle_vertices = cubicle_vertices();
-
                             let cubicle_buffer = glium::VertexBuffer::new(&display, &cubicle_vertices).unwrap();
-                            
                             let cubicle_indices = glium::index::NoIndices(glium::index::PrimitiveType::LinesList);
 
-                            // Shower Head
                             let shower_vertices = shower_head_vertices();
-
                             let shower_buffer = glium::VertexBuffer::new(&display, &shower_vertices).unwrap();
-
                             let shower_indices = glium::index::NoIndices(glium::index::PrimitiveType::TriangleFan);
 
                             let mut frame = display.draw();
+                            frame.clear_color_and_depth((0.02, 0.02, 0.02, 1.0), 1.0);
 
-                        frame.clear_color_and_depth((0.02, 0.02, 0.02, 1.0), 1.0);
+                            let particle_draw_params = glium::DrawParameters {
+                                point_size: Some(8.0),
+                                ..Default::default()
+                            };
 
-                        let particle_draw_params = glium::DrawParameters {
-                            point_size: Some(8.0),
-                            ..Default::default()
-                        };
+                            let line_draw_params = glium::DrawParameters {
+                                line_width: Some(2.0),
+                                ..Default::default()
+                            };
 
-                        let line_draw_params = glium::DrawParameters {
-                            line_width: Some(2.0),
-                            ..Default::default()
-                        };
+                            let perspective_matrix: Matrix4<f32> = perspective(Rad(std::f32::consts::FRAC_PI_4), 900.0 / 700.0, 0.1, 100.0);
+                            let view_matrix = Matrix4::look_to_rh(Point3::new(1.5, 1.2, 3.0), Vector3::new(-1.5, -1.2, -3.0), Vector3::unit_y());
+                            let matrix: [[f32; 4]; 4] = (perspective_matrix * view_matrix).into();
 
-                        let perspective_matrix: Matrix4<f32> = perspective(Rad(std::f32::consts::FRAC_PI_4), 900.0 / 700.0, 0.1, 100.0);
+                            let uniforms = glium::uniform! { matrix: matrix };
 
-                        let view_matrix = Matrix4::look_to_rh(Point3::new(1.5, 1.2, 3.0), Vector3::new(-1.5, -1.2, -3.0), Vector3::unit_y());
-
-                        let matrix: [[f32; 4]; 4] = (perspective_matrix * view_matrix).into();
-
-                        let uniforms = glium::uniform! {
-                            matrix: matrix
-                        };
-
-                        frame.draw(&particles_vertex_buffer, &particle_indices, &particle_program, &uniforms, &particle_draw_params).unwrap();
-
-                        frame.draw(&cubicle_buffer, &cubicle_indices, &line_program, &uniforms, &line_draw_params).unwrap();
-
-                        frame.draw(&shower_buffer, &shower_indices, &line_program, &uniforms, &line_draw_params).unwrap();
-
-                        frame.finish().unwrap();
+                            frame.draw(&particles_vertex_buffer, &particle_indices, &particle_program, &uniforms, &particle_draw_params).unwrap();
+                            frame.draw(&cubicle_buffer, &cubicle_indices, &line_program, &uniforms, &line_draw_params).unwrap();
+                            frame.draw(&shower_buffer, &shower_indices, &line_program, &uniforms, &line_draw_params).unwrap();
+                            frame.finish().unwrap();
                         }
 
                         _ => {}
@@ -329,7 +315,6 @@ fn run_benchmarks(){
     for _ in 0..NUM_PARTICLES {
         let (x, y, z) = random_emitter_position();
         let (vx, vy, vz) = random_cone_velocity();
-
         ps.particles.push(Particle::new(x, y, z, vx, vy, vz));
     }
 
@@ -342,8 +327,7 @@ fn run_benchmarks(){
 
 pub fn update_particle_chunk(particles : &mut [Particle], delta_time : f32, gravity : f32) -> usize {
     let mut local_floor_hits = 0;
-    for particle in particles
-    {
+    for particle in particles {
         particle.update_position(delta_time, gravity);
 
         if particle.y <= 0.0 {
@@ -371,7 +355,6 @@ pub fn resolve_collisions_threaded_atomic(
     let len = ps.particles.len();
 
     let grid = ps.build_grid(CELL_SIZE);
-
     let mut owned_cells: Vec<Vec<Cell>> = vec![Vec::new(); collision_threads];
 
     for &cell in grid.keys() {
@@ -426,7 +409,6 @@ pub fn resolve_collisions_threaded_atomic(
     ps.particles = new_particles;
 
     let merges = old_count - ps.particles.len();
-
     ps.stats.collision_count += merges;
     ps.stats.merge_count += merges;
 }
@@ -439,11 +421,11 @@ pub fn resolve_owned_grid_cells_atomic(
     states: &[AtomicU8],
     output_slots: &[Mutex<Option<Particle>>],
 ) {
+    let collision_sq = collision_radius * collision_radius;
+
     for &cell in owned_cells {
         if let Some(indices) = grid.get(&cell) {
             for &i in indices {
-                // Try to claim this particle as the active survivor.
-                // If another thread has already merged it, skip it.
                 if states[i]
                     .compare_exchange(ACTIVE, LOCKED, Ordering::AcqRel, Ordering::Acquire)
                     .is_err()
@@ -452,29 +434,26 @@ pub fn resolve_owned_grid_cells_atomic(
                 }
 
                 let mut current = particles[i];
-                let current_cell = get_cell(&current, CELL_SIZE);
+                let ((min_x, min_y, min_z), (max_x, max_y, max_z)) =
+                    collision_cell_bounds(&current, collision_radius, CELL_SIZE);
                 let mut has_merged = false;
 
-                for dx in -1..=1 {
+                for cell_x in min_x..=max_x {
                     if has_merged {
                         break;
                     }
 
-                    for dy in -1..=1 {
+                    for cell_y in min_y..=max_y {
                         if has_merged {
                             break;
                         }
 
-                        for dz in -1..=1 {
+                        for cell_z in min_z..=max_z {
                             if has_merged {
                                 break;
                             }
 
-                            let neighbour_cell = (
-                                current_cell.0 + dx,
-                                current_cell.1 + dy,
-                                current_cell.2 + dz,
-                            );
+                            let neighbour_cell = (cell_x, cell_y, cell_z);
 
                             if let Some(neighbour_indices) = grid.get(&neighbour_cell) {
                                 for &j in neighbour_indices {
@@ -489,12 +468,9 @@ pub fn resolve_owned_grid_cells_atomic(
                                     let dx = current.x - particles[j].x;
                                     let dy = current.y - particles[j].y;
                                     let dz = current.z - particles[j].z;
-
                                     let distance_sq = dx * dx + dy * dy + dz * dz;
-                                    let collision_sq = collision_radius * collision_radius;
 
                                     if distance_sq <= collision_sq {
-                                        // Try to claim particle j.
                                         if states[j]
                                             .compare_exchange(
                                                 ACTIVE,
@@ -515,10 +491,7 @@ pub fn resolve_owned_grid_cells_atomic(
                     }
                 }
 
-                // Store this particle's resulting state.
                 *output_slots[i].lock().unwrap() = Some(current);
-
-                // Unlock the survivor.
                 states[i].store(SURVIVOR, Ordering::Release);
             }
         }
@@ -551,10 +524,8 @@ fn run_threaded_simulation(
         let start = Instant::now();
 
         for step in 0..steps {
-            // Physics stage
             let chunk_size = (ps_clone.particles.len() / physics_threads).max(1);
             let chunk_count = (ps_clone.particles.len() + chunk_size - 1) / chunk_size;
-
             let mut floor_outputs = vec![0usize; chunk_count];
 
             physics_pool.scoped(|scope| {
@@ -572,7 +543,6 @@ fn run_threaded_simulation(
             let total_hits: usize = floor_outputs.iter().sum();
             ps_clone.stats.floor_hits += total_hits;
 
-            // Collision / merging stage
             resolve_collisions_threaded_atomic(
                 &mut ps_clone,
                 &mut collision_pool,
@@ -581,7 +551,6 @@ fn run_threaded_simulation(
                 &mut collision_scratch,
             );
 
-            // Temperature stage
             let temp_chunk_size = (ps_clone.particles.len() / temperature_threads).max(1);
 
             temperature_pool.scoped(|scope| {
